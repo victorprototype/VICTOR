@@ -1,26 +1,34 @@
 # ============================================================
 # VICTOR v6.0 — trainer.py
-# JIT-compiled train_step, training loop, stage logic
+# Closure-based JIT training step, training loop, stage logic
 # ============================================================
 # Public API
 # ----------
-#   build_optimizer(total_steps, lr, warmup)  → tx (optax chain)
-#   train_step(params, opt_state, ...)         → (params, opt_state, total, loss_dict)
-#   train_one_profile(...)                     → (params, opt_state, ep_global, best_data)
-#   train(...)                                 → (params, opt_state, hist, best_data)
+#   build_optimizer(total_steps, lr, warmup)   -> tx (optax chain)
+#   make_train_step(model, w_ops, weights, tx) -> step_fn (jit-compiled)
+#   train_one_profile(step_fn, ...)            -> (params, opt_state, ep_global, best_data)
+#   train(step_fn, ...)                        -> (params, opt_state, hist, best_data)
 #
-# Design principles
-# -----------------
-#  • train_step is @jax.jit — all Python bools / scalars resolved BEFORE
-#    the JIT boundary (no Python control flow inside JIT).
-#  • Noisy sinograms are re-drawn every LOG_EVERY steps to avoid
+# Architecture
+# ------------
+#  * tx, model, w_ops, and weights are Python objects — they cannot
+#    cross the JIT boundary as traced values.  They are closed over
+#    inside make_train_step() and never passed at runtime.
+#
+#  * Correct usage:
+#      tx      = build_optimizer(total_steps=N)
+#      step_fn = make_train_step(model=m, w_ops=ops, weights=w, tx=tx)
+#      train(step_fn=step_fn, ...)
+#
+#  * step_fn is compiled once and reused across all profiles / stages.
+#  * Noisy sinograms are re-drawn every log_every steps to avoid
 #    the network memorising a fixed noise realisation.
-#  • STAGES is consumed from config.py so Cell 1 constants propagate.
-#  • hist dict is updated in-place; callers receive the same object.
-#  • Gradient NaN / Inf values are zeroed before the optimiser update
-#    (the "safe grad" pattern used in the original notebook).
-#  • loss_fn is imported from losses.py; train_step is the only place
-#    that calls jax.value_and_grad — no value_and_grad elsewhere.
+#  * STAGES is consumed from config.py so Cell 1 constants propagate.
+#  * hist dict is updated in-place; callers receive the same object.
+#  * Gradient NaN / Inf values are zeroed before the optimiser update
+#    (the "safe grad" pattern).
+#  * loss_fn is imported from losses.py; value_and_grad is called only
+#    inside the closure returned by make_train_step().
 # ============================================================
 
 from __future__ import annotations
@@ -37,9 +45,9 @@ from victor import config as cfg
 from victor.losses import loss_fn, LossWeights, DEFAULT_WEIGHTS
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 # 1.  Optimiser factory
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 
 def build_optimizer(
     total_steps : int,
@@ -52,8 +60,8 @@ def build_optimizer(
 
     Schedule
     --------
-    0 → warmup steps : linear warm-up from 0 to lr
-    warmup → total   : cosine decay from lr to lr_end
+    0 -> warmup steps : linear warm-up from 0 to lr
+    warmup -> total   : cosine decay from lr to lr_end
 
     Parameters
     ----------
@@ -79,117 +87,66 @@ def build_optimizer(
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# 2.  JIT-compiled train_step
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
+# 2.  JIT-compiled step factory  (sole training-step entry point)
+# =======================================================================
 
-@jax.jit
-def train_step(
-    params      : dict,
-    opt_state,
-    tx,
-    g_noisy     : jnp.ndarray,
-    psi_n       : jnp.ndarray,
-    bpol_n      : jnp.ndarray,
-    R_flat      : jnp.ndarray,
-    Z_flat      : jnp.ndarray,
-    esrc        : jnp.ndarray,
-    edst        : jnp.ndarray,
-    ew          : jnp.ndarray,
-    ndeg        : jnp.ndarray,
-    rho_2d      : jnp.ndarray,
-    rho_flat    : jnp.ndarray,
-    active_mask : jnp.ndarray,
+def make_train_step(
     model,
-    weights     : LossWeights = DEFAULT_WEIGHTS,
-) -> Tuple[dict, object, jnp.ndarray, Dict[str, jnp.ndarray]]:
+    w_ops,
+    weights : LossWeights = DEFAULT_WEIGHTS,
+    tx      = None,
+):
     """
-    Single JIT-compiled gradient step.
+    Factory that returns the single JIT-compiled training step for VICTOR.
 
-    Computes forward pass → loss_fn → value_and_grad → safe-gradient
-    clipping → optax update → new params.
-
-    Parameters
-    ----------
-    params      : Flax param tree
-    opt_state   : optax optimiser state
-    tx          : optax GradientTransformation (the same object used for init)
-    g_noisy     : (128,)  noisy sinogram for this step
-    psi_n       : (N²,)   normalised ψ field
-    bpol_n      : (N²,)   normalised Bpol field
-    R_flat …    : geometry arrays (from Cell 2 scope)
-    active_mask : (128,)  float32  1 = active chord
-    model       : VICTOR_v6 instance
-    weights     : LossWeights  (default DEFAULT_WEIGHTS)
-
-    Returns
-    -------
-    new_params   : updated param tree
-    new_opt_state: updated optimiser state
-    total        : scalar float32  total loss
-    loss_dict    : dict[str → scalar float32]  individual components
-    """
-    def _loss(p):
-        eps_out, mean, std, preds = model.apply(
-            p,
-            R_flat, Z_flat, psi_n, bpol_n,
-            esrc, edst, ew, ndeg, rho_2d,
-        )
-        log_noise = p["params"]["log_noise"]      # (M,)
-        return loss_fn(
-            eps_out, mean, std, preds,
-            g_noisy, w_ops=None,                  # w_ops resolved inside loss_fn
-            active_mask=active_mask,
-            rho_2d=rho_2d,
-            rho_flat=rho_flat,
-            log_noise=log_noise,
-            weights=weights,
-        )
-
-    (total, loss_dict), grads = jax.value_and_grad(_loss, has_aux=True)(params)
-
-    # Zero out any NaN / Inf gradients (numerical safety)
-    grads = jax.tree_util.tree_map(
-        lambda g: jnp.where(jnp.isfinite(g), g, jnp.zeros_like(g)),
-        grads,
-    )
-
-    updates, new_opt_state = tx.update(grads, opt_state, params)
-    new_params = optax.apply_updates(params, updates)
-
-    return new_params, new_opt_state, total, loss_dict
-
-
-# ─── Variant that accepts w_ops explicitly (avoids closure captures) ──
-
-def make_train_step(model, w_ops, weights: LossWeights = DEFAULT_WEIGHTS):
-    """
-    Factory that returns a JIT-compiled train_step with model, w_ops,
-    and weights closed over.  Use this pattern instead of passing `model`
-    as a JIT argument, which is not supported by JAX.
+    All Python objects (tx, model, w_ops, weights) are closed over here
+    so they never cross the JIT boundary as traced values.  Call this
+    function ONCE before the training loop and reuse the returned step_fn
+    across all profiles and stages.
 
     Parameters
     ----------
     model   : VICTOR_v6 instance
     w_ops   : WOperators  (geometry.WOperators)
-    weights : LossWeights
+    weights : LossWeights  (default DEFAULT_WEIGHTS)
+    tx      : optax GradientTransformation -- required, closed over.
+              Do NOT pass tx to the returned step_fn at call time.
 
     Returns
     -------
-    jit-compiled callable with signature:
-        step_fn(params, opt_state, tx,
+    step_fn : jit-compiled callable with signature
+        step_fn(params, opt_state,
                 g_noisy, psi_n, bpol_n,
                 R_flat, Z_flat, esrc, edst, ew, ndeg,
                 rho_2d, rho_flat, active_mask)
-        → (new_params, new_opt_state, total, loss_dict)
+        -> (new_params, new_opt_state, total, loss_dict)
     """
+    if tx is None:
+        raise ValueError(
+            "make_train_step: `tx` (optax GradientTransformation) must be "
+            "supplied to the factory so it can be closed over. "
+            "Do not pass it as an argument to the returned step_fn."
+        )
+
     @jax.jit
     def _step(
-        params, opt_state, tx,
-        g_noisy, psi_n, bpol_n,
-        R_flat, Z_flat, esrc, edst, ew, ndeg,
-        rho_2d, rho_flat, active_mask,
-    ):
+        params,
+        opt_state,
+        g_noisy     : jnp.ndarray,
+        psi_n       : jnp.ndarray,
+        bpol_n      : jnp.ndarray,
+        R_flat      : jnp.ndarray,
+        Z_flat      : jnp.ndarray,
+        esrc        : jnp.ndarray,
+        edst        : jnp.ndarray,
+        ew          : jnp.ndarray,
+        ndeg        : jnp.ndarray,
+        rho_2d      : jnp.ndarray,
+        rho_flat    : jnp.ndarray,
+        active_mask : jnp.ndarray,
+    ) -> Tuple[dict, object, jnp.ndarray, Dict[str, jnp.ndarray]]:
+
         def _loss(p):
             eps_out, mean, std, preds = model.apply(
                 p,
@@ -207,60 +164,64 @@ def make_train_step(model, w_ops, weights: LossWeights = DEFAULT_WEIGHTS):
             )
 
         (total, ld), grads = jax.value_and_grad(_loss, has_aux=True)(params)
+
+        # Zero out any NaN / Inf gradients (numerical safety)
         grads = jax.tree_util.tree_map(
             lambda g: jnp.where(jnp.isfinite(g), g, jnp.zeros_like(g)),
             grads,
         )
-        updates, new_opt = tx.update(grads, opt_state, params)
-        return optax.apply_updates(params, updates), new_opt, total, ld
+
+        updates, new_opt_state = tx.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+
+        return new_params, new_opt_state, total, ld
 
     return _step
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# 3.  Single-profile training loop (one profile × all stages)
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
+# 3.  Single-profile training loop  (one profile x all stages)
+# =======================================================================
 
 def train_one_profile(
     *,
     step_fn,
-    params       : dict,
+    params            : dict,
     opt_state,
-    tx,
-    profile      : dict,
-    R_flat       : jnp.ndarray,
-    Z_flat       : jnp.ndarray,
-    esrc         : jnp.ndarray,
-    edst         : jnp.ndarray,
-    ew           : jnp.ndarray,
-    ndeg         : jnp.ndarray,
-    rho_2d       : jnp.ndarray,
-    rho_flat     : jnp.ndarray,
-    active_mask  : jnp.ndarray,
+    profile           : dict,
+    R_flat            : jnp.ndarray,
+    Z_flat            : jnp.ndarray,
+    esrc              : jnp.ndarray,
+    edst              : jnp.ndarray,
+    ew                : jnp.ndarray,
+    ndeg              : jnp.ndarray,
+    rho_2d            : jnp.ndarray,
+    rho_flat          : jnp.ndarray,
+    active_mask       : jnp.ndarray,
     inject_noise,
-    stages       : list              = cfg.STAGES,
-    ep_global    : int               = 0,
-    best_data    : float             = float("inf"),
-    start_stage  : int               = 0,
-    start_ep_in_stage : int          = 0,
-    hist         : Optional[dict]    = None,
-    do_checkpoint_fn                 = None,
-    prof_idx     : int               = 0,
-    log_every    : int               = cfg.LOG_EVERY,
-    save_every   : int               = cfg.SAVE_EVERY,
-    t0           : Optional[float]   = None,
+    stages            : list            = cfg.STAGES,
+    ep_global         : int             = 0,
+    best_data         : float           = float("inf"),
+    start_stage       : int             = 0,
+    start_ep_in_stage : int             = 0,
+    hist              : Optional[dict]  = None,
+    do_checkpoint_fn                    = None,
+    prof_idx          : int             = 0,
+    log_every         : int             = cfg.LOG_EVERY,
+    save_every        : int             = cfg.SAVE_EVERY,
+    t0                : Optional[float] = None,
 ) -> Tuple[dict, object, int, float]:
     """
     Train params through all noise stages for a single profile.
 
     Parameters
     ----------
-    step_fn      : jit-compiled step function from make_train_step()
+    step_fn      : jit-compiled step function from make_train_step().
+                   tx is already closed over inside step_fn.
     params       : current param tree (input/output)
     opt_state    : current optimiser state (input/output)
-    tx           : optax GradientTransformation (needed by step_fn)
     profile      : one dict from data_loader.load_profiles()
-    R_flat … active_mask : geometry arrays from Cell 2 scope
+    R_flat ... active_mask : geometry arrays from Cell 2 scope
     inject_noise : data_loader.inject_noise
     stages       : list of (n_steps, sigma) from config.STAGES
     ep_global    : global epoch counter at entry
@@ -283,13 +244,13 @@ def train_one_profile(
     if t0 is None:
         t0 = time.time()
 
-    psi_n  = profile["psi_n"]
-    bpol_n = profile["bpol_n"]
+    psi_n   = profile["psi_n"]
+    bpol_n  = profile["bpol_n"]
     g_clean = profile["g_ideal"]
 
     for si, (s_ep, s_sig) in enumerate(stages):
 
-        # ── Resume: skip completed stages for this profile ────────────
+        # -- Resume: skip completed stages for this profile ---------------
         if si < start_stage:
             continue
 
@@ -305,7 +266,7 @@ def train_one_profile(
 
         print(
             f"  Prof {prof_idx + 1} | stage {si + 1}/{len(stages)} "
-            f"σ={s_sig}  ep_range=[{ep_start},{s_ep})  "
+            f"sigma={s_sig}  ep_range=[{ep_start},{s_ep})  "
             f"Te_core={float(profile['Te_1d'][0]):.2f} keV"
         )
 
@@ -318,9 +279,9 @@ def train_one_profile(
                     jax.random.PRNGKey(ep_global + ep),
                 )
 
-            # ── Gradient step ─────────────────────────────────────────
+            # -- Gradient step --------------------------------------------
             params, opt_state, total, ld = step_fn(
-                params, opt_state, tx,
+                params, opt_state,
                 g_stage, psi_n, bpol_n,
                 R_flat, Z_flat,
                 esrc, edst, ew, ndeg,
@@ -329,7 +290,7 @@ def train_one_profile(
             )
             ep_global += 1
 
-            # ── History accumulation ──────────────────────────────────
+            # -- History accumulation -------------------------------------
             total_f = float(total)
             if np.isfinite(total_f):
                 _append(hist, "total", total_f)
@@ -338,15 +299,15 @@ def train_one_profile(
                 if float(ld.get("proj", float("inf"))) < best_data:
                     best_data = float(ld["proj"])
 
-            # ── Checkpoint ───────────────────────────────────────────
+            # -- Checkpoint -----------------------------------------------
             if ep_global % save_every == 0 and do_checkpoint_fn is not None:
                 do_checkpoint_fn(ep_global, prof_idx, si, ep + 1, best_data)
 
-            # ── Logging ──────────────────────────────────────────────
+            # -- Logging --------------------------------------------------
             if ep_global % log_every == 0:
-                proj_f = float(ld.get("proj",  0))
-                nll_f  = float(ld.get("nll",   0))
-                smth_f = float(ld.get("smooth", 0))
+                proj_f  = float(ld.get("proj",   0))
+                nll_f   = float(ld.get("nll",    0))
+                smth_f  = float(ld.get("smooth", 0))
                 elapsed = time.time() - t0
                 print(
                     f"    ep={ep_global:6d} | L={total_f:.5f} | "
@@ -357,16 +318,15 @@ def train_one_profile(
     return params, opt_state, ep_global, best_data
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# 4.  Full training loop  (all profiles × all stages × N_EPOCHS)
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
+# 4.  Full training loop  (all profiles x all stages x N_EPOCHS)
+# =======================================================================
 
 def train(
     *,
     step_fn,
     params       : dict,
     opt_state,
-    tx,
     profiles     : list,
     R_flat       : jnp.ndarray,
     Z_flat       : jnp.ndarray,
@@ -392,23 +352,22 @@ def train(
     """
     Outer training loop: iterate over all profiles and all noise stages.
 
-    This function is a thin wrapper that delegates to train_one_profile()
-    for each (profile, stage) block, handles the resume logic for
-    start_prof / start_stage / start_ep, and saves a final checkpoint
-    after each profile completes.
+    Thin wrapper that delegates to train_one_profile() for each
+    (profile, stage) block, handles resume logic, and saves a final
+    checkpoint after each profile completes.
 
     Parameters
     ----------
-    step_fn      : jit-compiled step from make_train_step()
+    step_fn      : jit-compiled step from make_train_step().
+                   tx is already closed over inside step_fn.
     params       : initial / resumed param tree
     opt_state    : initial / resumed optimiser state
-    tx           : optax GradientTransformation
     profiles     : list of profile dicts from data_loader.load_profiles()
-    R_flat … active_mask : geometry arrays (from Cell 2)
+    R_flat ... active_mask : geometry arrays (from Cell 2)
     inject_noise : data_loader.inject_noise
     stages       : list of (n_steps, sigma) tuples (default cfg.STAGES)
     ep_global    : starting global epoch (0 for fresh, >0 for resume)
-    best_data    : best projection loss so far (0.0 for fresh)
+    best_data    : best projection loss so far (inf for fresh)
     start_prof   : profile index to resume from
     start_stage  : stage index to resume from within start_prof
     start_ep     : epoch within start_stage to resume from
@@ -427,12 +386,12 @@ def train(
     if hist is None:
         hist = {}
 
-    t0      = time.time()
-    n_prof  = len(profiles)
+    t0       = time.time()
+    n_prof   = len(profiles)
     n_stages = len(stages)
     total_planned = sum(s for s, _ in stages) * n_prof
     print(f"\n{'='*60}")
-    print(f"VICTOR v6.0 — Training  ({n_prof} profiles × {n_stages} stages)")
+    print(f"VICTOR v6.0 -- Training  ({n_prof} profiles x {n_stages} stages)")
     print(f"  Total planned steps : {total_planned:,}")
     print(f"  Resume: prof={start_prof}  stage={start_stage}  ep={ep_global}")
     print(f"{'='*60}\n")
@@ -443,35 +402,34 @@ def train(
     for pi in range(start_prof, n_prof):
 
         params, opt_state, ep_global, best_data = train_one_profile(
-            step_fn          = step_fn,
-            params           = params,
-            opt_state        = opt_state,
-            tx               = tx,
-            profile          = profiles[pi],
-            R_flat           = R_flat,
-            Z_flat           = Z_flat,
-            esrc             = esrc,
-            edst             = edst,
-            ew               = ew,
-            ndeg             = ndeg,
-            rho_2d           = rho_2d,
-            rho_flat         = rho_flat,
-            active_mask      = active_mask,
-            inject_noise     = inject_noise,
-            stages           = stages,
-            ep_global        = ep_global,
-            best_data        = best_data,
-            start_stage      = _start_stage,
-            start_ep_in_stage= _start_ep,
-            hist             = hist,
-            do_checkpoint_fn = do_checkpoint_fn,
-            prof_idx         = pi,
-            log_every        = log_every,
-            save_every       = save_every,
-            t0               = t0,
+            step_fn           = step_fn,
+            params            = params,
+            opt_state         = opt_state,
+            profile           = profiles[pi],
+            R_flat            = R_flat,
+            Z_flat            = Z_flat,
+            esrc              = esrc,
+            edst              = edst,
+            ew                = ew,
+            ndeg              = ndeg,
+            rho_2d            = rho_2d,
+            rho_flat          = rho_flat,
+            active_mask       = active_mask,
+            inject_noise      = inject_noise,
+            stages            = stages,
+            ep_global         = ep_global,
+            best_data         = best_data,
+            start_stage       = _start_stage,
+            start_ep_in_stage = _start_ep,
+            hist              = hist,
+            do_checkpoint_fn  = do_checkpoint_fn,
+            prof_idx          = pi,
+            log_every         = log_every,
+            save_every        = save_every,
+            t0                = t0,
         )
 
-        # After first profile, resume offsets are consumed — always start fresh
+        # After first profile, resume offsets are consumed -- start fresh
         _start_stage = 0
         _start_ep    = 0
 
@@ -491,9 +449,9 @@ def train(
     return params, opt_state, hist, best_data
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 # 5.  Internal helpers
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 
 def _append(hist: dict, key: str, value: float) -> None:
     """Append a scalar to a history list, creating the list if needed."""
@@ -502,8 +460,8 @@ def _append(hist: dict, key: str, value: float) -> None:
     hist[key].append(value)
 
 
-# ── Module self-test ─────────────────────────────────────────────────
+# -- Module self-test ----------------------------------------------------
 
 if __name__ == "__main__":
-    print("trainer.py — no self-test (requires full pipeline).")
+    print("trainer.py -- no self-test (requires full pipeline).")
     print("Run Cell 5 in the notebook to exercise the training loop.")
