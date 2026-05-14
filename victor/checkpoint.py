@@ -112,7 +112,21 @@ def build_ckpt_manager(
         max_to_keep        = max_to_keep,
         save_interval_steps= 1,       # we control frequency ourselves
     )
-    mgr = ocp.CheckpointManager(ckpt_dir, options=options)
+    # orbax 0.11.x requires an explicit CompositeCheckpointer that registers
+    # each key upfront.  Passing just a directory uses the legacy API which
+    # raises "Unknown key" on save.
+    checkpointer = ocp.CompositeCheckpointer(
+        {
+            CKPT_PARAMS_KEY: ocp.PyTreeCheckpointer(),
+            CKPT_OPT_KEY   : ocp.PyTreeCheckpointer(),
+        },
+        options=options,
+    )
+    mgr = ocp.CheckpointManager(
+        ckpt_dir,
+        checkpointers=checkpointer,
+        options=options,
+    )
     print(f"CheckpointManager ready: {ckpt_dir}  (max_to_keep={max_to_keep})")
     return mgr
 
@@ -231,12 +245,15 @@ def do_checkpoint(
     params_np    = jax.tree_util.tree_map(np.array, params)
     opt_state_np = jax.tree_util.tree_map(np.array, opt_state)
 
+    # orbax 0.11.x uses args= with ocp.args.Composite instead of items=
     mgr.save(
         ep_global,
-        items={
-            CKPT_PARAMS_KEY: params_np,
-            CKPT_OPT_KEY   : opt_state_np,
-        },
+        args=ocp.args.Composite(
+            **{
+                CKPT_PARAMS_KEY: ocp.args.StandardSave(params_np),
+                CKPT_OPT_KEY   : ocp.args.StandardSave(opt_state_np),
+            }
+        ),
     )
     mgr.wait_until_finished()   # CRITICAL: blocks until disk write completes
 
@@ -296,12 +313,15 @@ def resume(
 
     # ── Restore Orbax checkpoint ──────────────────────────────────────
     try:
+        # orbax 0.11.x uses args= with ocp.args.Composite instead of items=
         restored = mgr.restore(
             latest,
-            items={
-                CKPT_PARAMS_KEY: params,
-                CKPT_OPT_KEY   : opt_state,
-            },
+            args=ocp.args.Composite(
+                **{
+                    CKPT_PARAMS_KEY: ocp.args.StandardRestore(params),
+                    CKPT_OPT_KEY   : ocp.args.StandardRestore(opt_state),
+                }
+            ),
         )
 
         # Move arrays back onto the JAX device
