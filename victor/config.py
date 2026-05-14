@@ -63,27 +63,25 @@ DS_MAX_FACTOR = 0.5        # ds_max = (2*EXT/N_GRID) * DS_MAX_FACTOR
 DS_MIN_FACTOR = 0.5        # ds_min = ds_max * DS_MIN_FACTOR
 
 # ── Paths ─────────────────────────────────────────────────────
-# Populated at runtime by Cell 1; defaults here allow standalone use.
-DRIVE       = os.environ.get("VICTOR_DRIVE", ".")
-DATASET_DIR = os.environ.get("VICTOR_DATASET",  f"{DRIVE}/victor_dataset")
-CKPT_DIR    = os.environ.get("VICTOR_CKPT",     f"{DRIVE}/VICTOR_v6")
-RESULTS_DIR = os.environ.get("VICTOR_RESULTS",  "./ono_results")
+# Repo-relative default paths (overrideable via environment variables).
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+DATASET_DIR = os.environ.get(
+    "VICTOR_DATASET",
+    os.path.join(ROOT_DIR, "victor_dataset")
+)
+
+CKPT_DIR = os.environ.get(
+    "VICTOR_CKPT",
+    os.path.join(ROOT_DIR, "checkpoints")
+)
+
+RESULTS_DIR = os.environ.get(
+    "VICTOR_RESULTS",
+    os.path.join(ROOT_DIR, "results")
+)
 
 
-def update_paths(drive: str) -> None:
-    """
-    Call once after Drive is mounted (or DRIVE is resolved) to propagate
-    the correct root into all path constants.
-
-    Example:
-    from victor import config as cfg
-        cfg.update_paths(DRIVE)
-    """
-    global DRIVE, DATASET_DIR, CKPT_DIR, RESULTS_DIR
-    DRIVE       = drive
-    DATASET_DIR = f"{drive}/victor_dataset"
-    CKPT_DIR    = f"{drive}/VICTOR_v6"
-    RESULTS_DIR = "./ono_results"
 
 
 def summary() -> None:
