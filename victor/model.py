@@ -44,7 +44,7 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 
-import config as cfg
+from victor import config as cfg
 
 
 # ── Named return type ─────────────────────────────────────────────────
