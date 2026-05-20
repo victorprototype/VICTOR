@@ -1,5 +1,5 @@
 # ============================================================
-# VICTOR v6.0 — data_loader.py
+# VICTOR v7.0 — data_loader.py
 # W matrix loading, TORAX profile loading, noise injection,
 # and field interpolation onto the reconstruction pixel grid.
 # ============================================================
@@ -9,6 +9,17 @@
 #   load_profiles(dataset_dir, ...)  → list[dict]
 #   inject_noise(g, sigma, key)      → jnp.ndarray
 #   interp_field(field, R_from, Z_from, R_to, Z_to) → np.ndarray
+#
+# v7 changes vs v6
+# ----------------
+#  • load_profiles() now accepts a xi parameter (9-D WEST GEM
+#    hardware vector) and stores it in every profile dict under
+#    the key "xi".  This allows losses.py and trainer.py to read
+#    profile["xi"] directly without threading xi_fixed through
+#    every function signature.
+#  • XI_DEFAULT constant defined at module level for convenience.
+#  • psi_n / bpol_n kept in profile dicts for backward compatibility
+#    but are no longer consumed by the v7 forward pass.
 #
 # Design principles
 # -----------------
@@ -34,6 +45,23 @@ from jax.experimental.sparse import BCOO
 
 from victor import config as cfg
 from victor import geometry as geom
+
+
+# ── Default WEST GEM hardware vector (9-D, normalised) ───────────────
+# Components grounded in Mazon 2015 / Chernyshova 2017-2019.
+# Override by passing xi= to load_profiles() if your experiment uses
+# different hardware settings.
+XI_DEFAULT = jnp.array([
+    83.0  / 128,    # [0] cam_a_chord_frac    vertical cam lines / 128
+    107.0 / 128,    # [1] cam_b_chord_frac    horizontal cam lines / 128
+    2.0   / 15,     # [2] e_low_norm          lower energy bound / 15 keV
+    15.0  / 15,     # [3] e_high_norm         upper energy bound / 15 keV
+    50.0  / 100,    # [4] be_window_norm      Be window thickness / 100 µm
+    473.0 / 1000,   # [5] detector_depth_norm detector depth / 1000 mm
+    0.8   / 2,      # [6] strip_pitch_norm    strip pitch / 2 mm
+    3.0   / 4,      # [7] gas_gain_log_norm   log10(1e3) / 4
+    80.0  / 128,    # [8] sampling_rate_norm  ADC rate / 128 MHz
+], dtype=jnp.float32)
 
 
 # ── Named return type for the W bundle ───────────────────────────────
@@ -192,10 +220,11 @@ def _safe_norm_11(x: np.ndarray) -> np.ndarray:
 # ── 5. Load TORAX equilibrium profiles ───────────────────────────────
 
 def load_profiles(
-    dataset_dir  : Optional[str]       = None,
-    n_profiles   : int                  = cfg.N_PROFILES,
-    w_bundle     : Optional[WBundle]    = None,
+    dataset_dir  : Optional[str]            = None,
+    n_profiles   : int                       = cfg.N_PROFILES,
+    w_bundle     : Optional[WBundle]         = None,
     grids        : Optional[geom.PixelGrids] = None,
+    xi           : Optional[jnp.ndarray]     = None,
 ) -> List[Dict[str, Any]]:
     """
     Load TORAX equilibrium profiles and pre-process for training.
@@ -216,6 +245,10 @@ def load_profiles(
     grids       : PixelGrids
         Pixel grid arrays for field interpolation.
         If None, built internally via geometry.build_pixel_grids().
+    xi          : jnp.ndarray, optional
+        9-D normalised WEST GEM hardware vector (see XI_DEFAULT).
+        Defaults to XI_DEFAULT if not supplied.
+        The same vector is stored in every profile dict under key "xi".
 
     Returns
     -------
@@ -227,6 +260,7 @@ def load_profiles(
         Te_1d    : (n_rho,)   float32   electron temperature [keV]
         ne_1d    : (n_rho,)   float32   electron density
         g_ideal  : (128,)     float32   clean projected sinogram
+        xi       : (9,)       float32   WEST GEM hardware vector
 
         # ── Scalars ────────────────────────────────────────────────
         g_scale  : float   max of raw sinogram (for de-normalisation)
@@ -240,6 +274,9 @@ def load_profiles(
     """
     if dataset_dir is None:
         dataset_dir = cfg.DATASET_DIR
+
+    if xi is None:
+        xi = XI_DEFAULT
 
     if grids is None:
         grids = geom.build_pixel_grids()
@@ -298,6 +335,7 @@ def load_profiles(
             Te_1d   = jnp.array(Te_1d),
             ne_1d   = jnp.array(ne_1d),
             g_ideal = g_ideal,
+            xi      = xi,                                              # (9,)
 
             # ── Scalars ───────────────────────────────────────────────
             g_scale = g_max,
