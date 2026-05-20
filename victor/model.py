@@ -1,39 +1,50 @@
 # ============================================================
-# VICTOR v6.0 — model.py
-# Architecture: HashGrid, SIRENLayer, SO2Harmonics,
-#               SharedTrunk, PIGNO, VICTOR_v6
+# VICTOR v7.0 — model.py
+# Architecture: FourierLayer1D, UFourierLayer1D,
+#               BranchNet, TrunkNet, FourierDeepONet
 # ============================================================
 # Public API
 # ----------
-#   HashGrid       — multi-resolution hash grid (pure JAX)
-#   SIRENLayer     — SIREN layer with learnable ω₀
-#   SO2Harmonics   — SO(2) angular harmonics encoder
-#   SharedTrunk    — shared feature extractor (hash + SIREN)
-#   MemberAdapter  — per-ensemble-member adapter MLP
-#   PIGNO          — physics-informed graph neural operator
-#   VICTOR_v6      — full model: shared trunk + adapters + PIGNO
+#   FourierLayer1D   — single 1-D Fourier layer (spectral + residual)
+#   UFourierLayer1D  — U-Fourier layer with U-Net skip connection
+#   BranchNet        — MLP encoder for chord measurements g_obs
+#   TrunkNet         — MLP encoder for WEST GEM source/geometry xi (9-D)
+#   FourierDeepONet  — full model: branch + trunk + Fourier decoder
 #
-#   build_model()  — instantiate VICTOR_v6 and initialise params
-#   count_params() — count total trainable parameters
+#   build_model()    — instantiate FourierDeepONet and initialise params
+#   count_params()   — count total trainable parameters
 #
 # Design principles
 # -----------------
 #  • All modules are pure Flax nn.Module subclasses.
 #  • No JAX globals are mutated; callers own the returned params.
-#  • profile field arrays (psi_n, bpol_n) are plain jnp arrays —
-#    never nested dicts passed into @jax.jit (v5 FIX).
-#  • PIGNO boundary mask is a smooth sigmoid (hard boundary via ρ).
+#  • Branch net encodes chord measurements g_obs -> (n_radial, C).
+#  • Trunk net encodes 9-D WEST GEM hardware vector xi -> (C,).
+#  • Merger: pointwise multiply (per vanilla DeepONet).
+#  • Decoder: 1 FourierLayer1D + 2 UFourierLayer1D -> radial output.
+#  • Output: sigmoid -> emissivity profile in [0, 1].
+#
+# xi vector (9 components) grounded in Mazon 2015 / Chernyshova 2017-2019:
+#   [0] cam_a_chord_frac    vertical cam lines / 128      (83/128 ≈ 0.648)
+#   [1] cam_b_chord_frac    horizontal cam lines / 128   (107/128 ≈ 0.836)
+#   [2] e_low_norm          lower energy bound / 15 keV    (2/15 ≈ 0.133)
+#   [3] e_high_norm         upper energy bound / 15 keV    (15/15 = 1.0)
+#   [4] be_window_norm      Be window thickness / 100 µm  (50/100 = 0.5)
+#   [5] detector_depth_norm detector depth / 1000 mm    (473/1000 = 0.473)
+#   [6] strip_pitch_norm    strip pitch / 2 mm             (0.8/2 = 0.4)
+#   [7] gas_gain_log_norm   log10(gas_gain) / 4          (log10(1e3)/4 = 0.75)
+#   [8] sampling_rate_norm  ADC rate / 128 MHz            (80/128 ≈ 0.625)
 # ============================================================
 
 from __future__ import annotations
 
-from typing import List, Tuple, NamedTuple
+from typing import List, Sequence, Tuple, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
 
-from victor import config as cfg
+import config as cfg
 
 
 # ── Named return type ─────────────────────────────────────────────────
@@ -45,537 +56,330 @@ class ModelBundle(NamedTuple):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 1.  HashGrid
+# 1.  FourierLayer1D
 # ═══════════════════════════════════════════════════════════════════════
 
-class HashGrid(nn.Module):
+class FourierLayer1D(nn.Module):
     """
-    Multi-resolution hash grid encoding (pure JAX — no CUDA extensions).
+    Single Fourier layer for 1-D sequences.
 
-    Maps a batch of 2-D coordinates in [-1, 1]² to a concatenated
-    feature vector of length L × F by bilinearly interpolating
-    per-level hash tables.
+    Keeps sequence length unchanged via two parallel paths:
+      Spectral path : IFFT(R · FFT(x))   truncated to n_modes
+      Residual path : W · x              learned Dense projection
+
+    Output: relu(spectral + residual)
 
     Parameters
     ----------
-    L : int   Number of resolution levels.
-    T : int   Hash-table size (number of entries per level).
-    F : int   Feature dimension per entry.
-    b : float Growth factor between consecutive level resolutions.
+    n_channels : int   Number of feature channels C.
+    n_modes    : int   Number of Fourier modes retained (k_max).
 
-    Input
-    -----
-    xy : (N, 2)  coordinates in [-1, 1]²
-
-    Output
-    ------
-    (N, L*F)  concatenated multi-scale features
+    Input / Output
+    --------------
+    x : (L, C)  ->  (L, C)
     """
 
-    L : int   = cfg.L_HASH
-    T : int   = cfg.T_COORD
-    F : int   = cfg.F_HASH
-    b : float = 1.38
-
-    # Fibonacci hash constants (int32 two's-complement safe)
-    _PI1 : int = -1_640_531_535
-    _PI2 : int =    805_459_861
-
-    @nn.compact
-    def __call__(self, xy: jnp.ndarray) -> jnp.ndarray:
-        """
-        Parameters
-        ----------
-        xy : (N, 2)  float32, values in [-1, 1]
-
-        Returns
-        -------
-        (N, L*F)  float32
-        """
-        pi1 = jnp.int32(self._PI1)
-        pi2 = jnp.int32(self._PI2)
-
-        feats: List[jnp.ndarray] = []
-
-        for lev in range(self.L):
-            res   = int(16 * (self.b ** lev))
-            table = self.param(
-                f"t{lev}",
-                nn.initializers.uniform(1e-4),
-                (self.T, self.F),
-            )
-
-            # Map to [0, res]
-            sc = (xy * 0.5 + 0.5) * res
-            fl = jnp.floor(sc).astype(jnp.int32)
-            fr = sc - fl.astype(jnp.float32)           # fractional part
-
-            # Four corners of the enclosing cell (N, 4, 2)
-            corners = jnp.stack(
-                [
-                    fl,
-                    fl + jnp.array([1, 0]),
-                    fl + jnp.array([0, 1]),
-                    fl + jnp.array([1, 1]),
-                ],
-                axis=1,
-            )
-
-            cx = corners[:, :, 0]   # (N, 4)
-            cy = corners[:, :, 1]   # (N, 4)
-
-            # Spatial hash: h = |(cx * π₁) XOR (cy * π₂)| mod T
-            h = jnp.abs(
-                jnp.mod(
-                    jnp.bitwise_xor(
-                        (cx * pi1).astype(jnp.int32),
-                        (cy * pi2).astype(jnp.int32),
-                    ),
-                    self.T,
-                )
-            )
-
-            cf = table[h]           # (N, 4, F)
-
-            # Bilinear weights (N, 4, 1)
-            fx = fr[:, 0:1]
-            fy = fr[:, 1:2]
-            w  = jnp.stack(
-                [(1 - fx) * (1 - fy), fx * (1 - fy),
-                 (1 - fx) * fy,       fx * fy],
-                axis=1,
-            )
-
-            feats.append(jnp.sum(w * cf, axis=1))   # (N, F)
-
-        return jnp.concatenate(feats, axis=-1)        # (N, L*F)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 2.  SIRENLayer
-# ═══════════════════════════════════════════════════════════════════════
-
-class SIRENLayer(nn.Module):
-    """
-    Sinusoidal representation network (SIREN) layer with a
-    learnable per-layer frequency parameter ω₀.
-
-    The first layer uses a uniform weight initialisation over
-    (-1/fan_in, 1/fan_in); subsequent layers use the SIREN-paper
-    scheme √(6/fan_in) / ω₀.
-
-    Parameters
-    ----------
-    features  : int    Output width.
-    is_first  : bool   True for the first layer of a SIREN stack.
-    omega_0   : float  Initial value of the learnable ω₀.
-    """
-
-    features : int
-    is_first : bool  = False
-    omega_0  : float = 30.0
+    n_channels : int
+    n_modes    : int
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """
         Parameters
         ----------
-        x : (N, D)  float32
+        x : (L, C)  float32
 
         Returns
         -------
-        (N, features)  float32   sin(ω₀ · W x)
+        (L, C)  float32
         """
-        om = self.param(
-            "om",
-            nn.initializers.constant(self.omega_0),
-            (1,),
-        )
+        L, C = x.shape
 
-        if self.is_first:
-            scale = 1.0 / x.shape[-1]
-        else:
-            scale = jnp.sqrt(6.0 / x.shape[-1]) / self.omega_0
+        # ── Spectral path ─────────────────────────────────────────────
+        xf     = jnp.fft.rfft(x, axis=0)              # (L//2+1, C)
+        n_freq = xf.shape[0]
+        k      = min(self.n_modes, n_freq)
 
-        w = nn.Dense(
-            self.features,
-            kernel_init=nn.initializers.uniform(scale),
-        )(x)
+        # Complex weight tensor R: (k, C, C)
+        R_re = self.param('R_re', nn.initializers.glorot_normal(), (k, C, C))
+        R_im = self.param('R_im', nn.initializers.glorot_normal(), (k, C, C))
+        R    = R_re + 1j * R_im
 
-        return jnp.sin(om * w)
+        # Mix kept modes: (k, C) x (k, C, C) -> (k, C)
+        xf_out  = jnp.einsum('ki,kij->kj', xf[:k], R)
+        xf_full = jnp.zeros_like(xf).at[:k].set(xf_out)   # (n_freq, C)
+        x_spec  = jnp.fft.irfft(xf_full, n=L, axis=0)     # (L, C)
+
+        # ── Residual path ─────────────────────────────────────────────
+        x_res = nn.Dense(self.n_channels)(x)               # (L, C)
+
+        return nn.relu(x_spec + x_res)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 3.  SO2Harmonics
+# 2.  UFourierLayer1D
 # ═══════════════════════════════════════════════════════════════════════
 
-class SO2Harmonics(nn.Module):
+class UFourierLayer1D(nn.Module):
     """
-    SO(2) angular harmonic encoder.
+    U-Fourier layer: Fourier layer with an additional U-Net-style skip
+    from the global average of the input.
 
-    Computes cos(m·θ) and sin(m·θ) for m = 0 … n_orders-1, then
-    projects the raw harmonics through a learned Dense layer.
+    Optionally projects the sequence length L -> out_len via linear
+    interpolation along the sequence axis.
 
     Parameters
     ----------
-    n_orders : int   Number of angular frequency orders.
+    n_channels : int        Number of feature channels C.
+    n_modes    : int        Number of Fourier modes retained.
+    out_len    : int | None Target output length. None keeps L unchanged.
 
-    Input
-    -----
-    theta : (N,)  angles in radians
-
-    Output
-    ------
-    (N, n_orders*2)  float32
+    Input / Output
+    --------------
+    x : (L, C)  ->  (out_len or L, C)
     """
 
-    n_orders : int = 4
+    n_channels : int
+    n_modes    : int
+    out_len    : int = None
 
     @nn.compact
-    def __call__(self, theta: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """
         Parameters
         ----------
-        theta : (N,)  float32
+        x : (L, C)  float32
 
         Returns
         -------
-        (N, n_orders*2)  float32
+        (target, C)  float32  where target = out_len if set, else L
         """
-        parts = [jnp.ones_like(theta[:, None])]   # m = 0  (constant)
+        L, C   = x.shape
+        target = self.out_len if self.out_len is not None else L
 
-        for m in range(1, self.n_orders):
-            parts.append(jnp.cos(m * theta[:, None]))
-            parts.append(jnp.sin(m * theta[:, None]))
+        # ── Fourier spectral path ─────────────────────────────────────
+        xf     = jnp.fft.rfft(x, axis=0)
+        n_freq = xf.shape[0]
+        k      = min(self.n_modes, n_freq)
 
-        h = jnp.concatenate(parts, axis=-1)        # (N, 2*n_orders - 1)
+        R_re   = self.param('R_re', nn.initializers.glorot_normal(), (k, C, C))
+        R_im   = self.param('R_im', nn.initializers.glorot_normal(), (k, C, C))
+        R      = R_re + 1j * R_im
+        xf_out = jnp.einsum('ki,kij->kj', xf[:k], R)
+        xf_full= jnp.zeros_like(xf).at[:k].set(xf_out)
+        x_spec = jnp.fft.irfft(xf_full, n=L, axis=0)     # (L, C)
 
-        return nn.Dense(
-            self.n_orders * 2,
-            kernel_init=nn.initializers.glorot_normal(),
-        )(h)                                        # (N, n_orders*2)
+        # ── Residual (W · x) path ─────────────────────────────────────
+        x_res  = nn.Dense(self.n_channels)(x)              # (L, C)
+
+        # ── U-Net skip: global average broadcast ──────────────────────
+        x_avg  = jnp.mean(x, axis=0, keepdims=True)       # (1, C)
+        x_skip = nn.Dense(self.n_channels)(x_avg)          # (1, C)
+        x_skip = jnp.broadcast_to(x_skip, x_res.shape)    # (L, C)
+
+        z = nn.relu(x_spec + x_res + x_skip)              # (L, C)
+
+        # ── Optional length projection L -> target ────────────────────
+        if target != L:
+            z = jax.image.resize(z, shape=(target, C), method='linear')
+
+        # ── Per-position linear projection (W' in paper) ──────────────
+        z = nn.Dense(self.n_channels)(z)
+        return nn.relu(z)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 4.  SharedTrunk
+# 3.  BranchNet
 # ═══════════════════════════════════════════════════════════════════════
 
-class SharedTrunk(nn.Module):
+class BranchNet(nn.Module):
     """
-    Shared feature extractor — parameters shared across all ensemble
-    members.
+    MLP branch net that encodes chord measurements g_obs.
 
-    Concatenates spatial hash features, field hash features, and SO(2)
-    angular features, then passes them through a two-layer SIREN MLP.
+    Projects g_obs (n_chords,) to a latent sequence (n_radial, C) that
+    aligns with the output radial grid.
 
-    Input dimensions (defaults)
-    ---------------------------
-    hash_coord : (N, L*F)     = (N, 32)   spatial hash
-    hash_field : (N, L//2*F)  = (N, 16)   field hash
-    so2_feat   : (N, 8)                   angular harmonics
-    ───────────────────────────────────────
-    concat       (N, 56)
-
-    Output
-    ------
-    (N, hidden)  float32   shared trunk features
-    """
-
-    hidden : int = 256
-
-    @nn.compact
-    def __call__(
-        self,
-        hash_coord : jnp.ndarray,
-        hash_field : jnp.ndarray,
-        so2_feat   : jnp.ndarray,
-    ) -> jnp.ndarray:
-        """
-        Parameters
-        ----------
-        hash_coord : (N, 32)
-        hash_field : (N, 16)
-        so2_feat   : (N, 8)
-
-        Returns
-        -------
-        (N, hidden)  float32
-        """
-        x = jnp.concatenate([hash_coord, hash_field, so2_feat], axis=-1)
-        x = SIRENLayer(self.hidden, is_first=True)(x)
-        x = SIRENLayer(self.hidden)(x)
-        return x                                    # (N, hidden)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 5.  MemberAdapter
-# ═══════════════════════════════════════════════════════════════════════
-
-class MemberAdapter(nn.Module):
-    """
-    Tiny per-ensemble-member adapter MLP.
-
-    Each adapter has independent weights and maps the shared trunk
-    output to a positive scalar emissivity at every pixel.
-
-    Architecture:  trunk → Dense(64) → GELU → Dense(1) → softplus
-
-    Input
-    -----
-    trunk_out : (N, 256)   shared trunk features
-
-    Output
-    ------
-    (N,)  float32   positive emissivity prediction for one member
-    """
-
-    @nn.compact
-    def __call__(self, trunk_out: jnp.ndarray) -> jnp.ndarray:
-        """
-        Parameters
-        ----------
-        trunk_out : (N, hidden)
-
-        Returns
-        -------
-        (N,)  float32  softplus-activated scalar output
-        """
-        h   = nn.Dense(64, kernel_init=nn.initializers.glorot_normal())(trunk_out)
-        h   = nn.gelu(h)
-        out = nn.Dense(1,  kernel_init=nn.initializers.normal(0.01))(h)
-        return nn.softplus(out.squeeze(-1))          # (N,)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 6.  PIGNO  —  Physics-Informed Graph Neural Operator
-# ═══════════════════════════════════════════════════════════════════════
-
-class PIGNO(nn.Module):
-    """
-    Physics-Informed Graph Neural Operator.
-
-    Performs message passing on the rho-proximity graph to propagate
-    information along iso-flux surfaces, enforcing the physical
-    constraint that emissivity varies smoothly with normalised radius ρ.
-
-    Each layer computes edge messages from (h_src, h_dst, weight),
-    aggregates by degree-normalised scatter, and applies LayerNorm
-    with a residual connection.
+    Architecture:  g -> [Dense(h) -> SiLU -> LayerNorm] × n_layers
+                      -> Dense(n_radial * C) -> reshape(n_radial, C)
 
     Parameters
     ----------
-    n_layers : int   Number of message-passing layers (default 2).
-    hidden   : int   Hidden width in the edge MLP (default 96).
-    N        : int   Grid size; output is (N, N) (default 128).
+    hidden_dims : Sequence[int]   Hidden layer widths.
+    n_radial    : int             Output sequence length L.
+    n_channels  : int             Output channel width C.
 
-    Inputs
-    ------
-    eps_2d : (N, N)   initial emissivity estimate from the ensemble mean
-    esrc   : (E,)     int32  edge source indices  (flat pixel index)
-    edst   : (E,)     int32  edge destination indices
-    ew     : (E,)     float32 edge weights (RBF in ρ-space)
-    ndeg   : (N²,)   float32 per-node degree (≥ 1)
-
-    Output
-    ------
-    (N, N)  float32   refined emissivity, positive via softplus
+    Input / Output
+    --------------
+    g : (n_chords,)  ->  (n_radial, n_channels)
     """
 
-    n_layers : int = cfg.PIGNO_LAYERS
-    hidden   : int = cfg.PIGNO_HIDDEN
-    N        : int = cfg.N_GRID
+    hidden_dims : Sequence[int]
+    n_radial    : int
+    n_channels  : int
 
     @nn.compact
-    def __call__(
-        self,
-        eps_2d : jnp.ndarray,
-        esrc   : jnp.ndarray,
-        edst   : jnp.ndarray,
-        ew     : jnp.ndarray,
-        ndeg   : jnp.ndarray,
-    ) -> jnp.ndarray:
+    def __call__(self, g: jnp.ndarray) -> jnp.ndarray:
         """
         Parameters
         ----------
-        eps_2d : (N, N)
-        esrc   : (E,) int32
-        edst   : (E,) int32
-        ew     : (E,) float32
-        ndeg   : (N²,) float32
+        g : (n_chords,)  float32
 
         Returns
         -------
-        (N, N)  float32
+        (n_radial, n_channels)  float32
         """
-        n_nodes = self.N * self.N
-        h       = eps_2d.flatten()[:, None]          # (N², 1)
-        deg     = ndeg[:, None]                      # (N², 1)
-
-        for _ in range(self.n_layers):
-            h_src  = h[esrc]                         # (E, 1)
-            h_dst  = h[edst]                         # (E, 1)
-            w      = ew[:, None]                     # (E, 1)
-
-            # Edge message: concat [h_src | h_dst | weight]
-            msg = jnp.concatenate([h_src, h_dst, w], axis=-1)   # (E, 3)
-            msg = nn.Dense(
-                self.hidden,
-                kernel_init=nn.initializers.glorot_normal(),
-            )(msg)
-            msg = nn.gelu(msg)
-            msg = nn.Dense(
-                1,
-                kernel_init=nn.initializers.glorot_normal(),
-            )(msg)                                               # (E, 1)
-
-            # Degree-normalised scatter-add to destination nodes
-            h_agg = (
-                jnp.zeros((n_nodes, 1))
-                .at[edst]
-                .add(msg * w)
-            )
-            h_agg = h_agg / deg                      # normalise
-
-            # Residual + LayerNorm
-            h = nn.LayerNorm()(h + h_agg)
-
-        return nn.softplus(h).squeeze(-1).reshape(self.N, self.N)
+        h = g
+        for dim in self.hidden_dims:
+            h = nn.Dense(dim)(h)
+            h = nn.silu(h)
+            h = nn.LayerNorm()(h)
+        h = nn.Dense(self.n_radial * self.n_channels)(h)  # (L*C,)
+        return h.reshape(self.n_radial, self.n_channels)  # (L, C)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 7.  VICTOR_v6  —  Full Model
+# 4.  TrunkNet
 # ═══════════════════════════════════════════════════════════════════════
 
-class VICTOR_v6(nn.Module):
+class TrunkNet(nn.Module):
     """
-    VICTOR v6.0 — full reconstruction model.
+    MLP trunk net that encodes WEST GEM source/geometry parameters xi.
 
-    Architecture summary
-    --------------------
+    xi is a 9-D vector of normalised hardware constants:
+      [0] cam_a_chord_frac    vertical cam chord count / 128   (Chernyshova 2017)
+      [1] cam_b_chord_frac    horizontal cam chord count / 128 (Chernyshova 2017)
+      [2] e_low_norm          lower SXR energy / 15 keV        (Mazon 2015)
+      [3] e_high_norm         upper SXR energy / 15 keV        (Mazon 2015)
+      [4] be_window_norm      Be window thickness / 100 µm     (Mazon 2015)
+      [5] detector_depth_norm thimble depth / 1000 mm          (Mazon 2015)
+      [6] strip_pitch_norm    readout strip pitch / 2 mm       (Chernyshova 2017)
+      [7] gas_gain_log_norm   log10(gain) / 4                  (Chernyshova 2017)
+      [8] adc_rate_norm       ADC rate / 128 MHz               (Krawczyk 2018)
+
+    Architecture:  xi -> [Dense(h) -> SiLU] × n_layers -> Dense(C)
+
+    Parameters
+    ----------
+    hidden_dims : Sequence[int]   Hidden layer widths.
+    n_channels  : int             Output width C.
+
+    Input / Output
+    --------------
+    xi : (9,)  ->  (n_channels,)
+    """
+
+    hidden_dims : Sequence[int]
+    n_channels  : int
+
+    @nn.compact
+    def __call__(self, xi: jnp.ndarray) -> jnp.ndarray:
+        """
+        Parameters
+        ----------
+        xi : (9,)  float32
+
+        Returns
+        -------
+        (n_channels,)  float32
+        """
+        h = xi
+        for dim in self.hidden_dims:
+            h = nn.Dense(dim)(h)
+            h = nn.silu(h)
+        return nn.Dense(self.n_channels)(h)               # (C,)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 5.  FourierDeepONet  —  Full Model
+# ═══════════════════════════════════════════════════════════════════════
+
+class FourierDeepONet(nn.Module):
+    """
+    Fourier-enhanced Deep Operator Network for VICTOR Phase 2.
+
+    Architecture (mirrors Zhu et al. 2023, adapted for 1-D radial output):
     ┌─────────────────────────────────────────────────────┐
-    │  Dual hash grid                                      │
-    │    coord hash  (T=8192, L=16, F=2) → (N, 32)        │
-    │    field hash  (T=4096, L= 8, F=2) → (N, 16)        │
-    │  SO2Harmonics  (n_orders=4)        → (N,  8)        │
-    │                                    ─────────        │
-    │  Concat                            → (N, 56)        │
-    │  SharedTrunk  (hidden=256)         → (N,256)        │
+    │  Branch net  MLP(g_obs)          -> (n_radial, C)   │
+    │  Trunk net   MLP(xi)             -> (C,)            │
+    │  Merger      pointwise multiply  -> (n_radial, C)   │
     │                                                     │
-    │  MemberAdapter × n_members         → (M, N)         │
-    │    mean / std of ensemble predictions               │
-    │                                                     │
-    │  PIGNO  (n_layers=2, hidden=96)                     │
-    │    applied to ensemble mean (128,128)               │
-    │                                                     │
-    │  Sigmoid boundary mask (ρ < 1)                      │
+    │  Decoder:                                           │
+    │    FourierLayer1D (C, n_modes)   -> (n_radial, C)   │
+    │    UFourierLayer1D × 2           -> (n_radial, C)   │
+    │    Dense(64) -> ReLU                                │
+    │    Dense(1)  -> squeeze -> sigmoid                  │
+    │                                  -> (n_radial,)     │
     └─────────────────────────────────────────────────────┘
 
-    Total ~ 570 k parameters (target 500 k – 600 k).
+    Parameters
+    ----------
+    branch_hidden : Sequence[int]   Branch MLP hidden widths.
+    trunk_hidden  : Sequence[int]   Trunk MLP hidden widths.
+    n_channels    : int             Latent channel width C.
+    n_modes       : int             Truncated Fourier modes k_max.
+    n_radial      : int             Output radial grid points L.
 
     Forward signature
     -----------------
-    (R_flat, Z_flat, psi_n, bpol_n, esrc, edst, ew, ndeg, rho_2d)
+    (g, xi)
 
-    All array inputs are plain jnp arrays — never nested dicts
-    (FIX over v5: dicts must not be passed as jax.jit arguments).
+    Inputs
+    ------
+    g  : (n_chords,)  normalised chord measurements
+    xi : (9,)         WEST GEM geometry/source parameters (see TrunkNet)
 
     Returns
     -------
-    eps_out  : (N, N)     final emissivity (masked, positive)
-    mean     : (N²,)      ensemble mean  (pre-PIGNO)
-    std      : (N²,)      ensemble uncertainty (pre-PIGNO)
-    preds    : (M, N²)    per-member predictions
+    eps1d : (n_radial,)  emissivity radial profile in [0, 1]
     """
 
-    n_members : int = cfg.N_ENS
+    branch_hidden : Sequence[int]
+    trunk_hidden  : Sequence[int]
+    n_channels    : int
+    n_modes       : int
+    n_radial      : int
 
-    def setup(self) -> None:
-        # ── Shared encoders ───────────────────────────────────────────
-        self.hash_coord = HashGrid(L=cfg.L_HASH,       T=cfg.T_COORD, F=cfg.F_HASH)
-        self.hash_field = HashGrid(L=cfg.L_HASH // 2,  T=cfg.T_FIELD, F=cfg.F_HASH)
-        self.so2        = SO2Harmonics(n_orders=4)
-        self.trunk      = SharedTrunk(hidden=256)
-
-        # ── Per-member adapters ───────────────────────────────────────
-        # List comprehension; each adapter has independent weights.
-        self.adapters   = [MemberAdapter() for _ in range(self.n_members)]
-
-        # ── Learnable per-member noise floor ─────────────────────────
-        self.log_noise  = self.param(
-            "log_noise",
-            nn.initializers.constant(-3.0),
-            (self.n_members,),
-        )
-
-        # ── PIGNO ─────────────────────────────────────────────────────
-        self.pigno = PIGNO(
-            n_layers = cfg.PIGNO_LAYERS,
-            hidden   = cfg.PIGNO_HIDDEN,
-            N        = cfg.N_GRID,
-        )
-
+    @nn.compact
     def __call__(
         self,
-        R_flat  : jnp.ndarray,   # (N²,) major radius [m]
-        Z_flat  : jnp.ndarray,   # (N²,) vertical coord [m]
-        psi_n   : jnp.ndarray,   # (N²,) normalised ψ  ∈ [-1,1]
-        bpol_n  : jnp.ndarray,   # (N²,) normalised Bpol ∈ [-1,1]
-        esrc    : jnp.ndarray,   # (E,)  int32  edge sources
-        edst    : jnp.ndarray,   # (E,)  int32  edge destinations
-        ew      : jnp.ndarray,   # (E,)  float32 edge weights
-        ndeg    : jnp.ndarray,   # (N²,) float32 node degrees
-        rho_2d  : jnp.ndarray,   # (N, N) normalised elliptic radius
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        g  : jnp.ndarray,   # (n_chords,)
+        xi : jnp.ndarray,   # (9,)
+    ) -> jnp.ndarray:
         """
-        Forward pass.
+        Parameters
+        ----------
+        g  : (n_chords,)  float32
+        xi : (9,)         float32
 
         Returns
         -------
-        eps_out : (N, N)   final masked emissivity
-        mean    : (N²,)    ensemble mean (pre-PIGNO)
-        std     : (N²,)    ensemble uncertainty estimate
-        preds   : (M, N²)  per-member predictions
+        eps1d : (n_radial,)  float32  in [0, 1]
         """
-        # ── Normalise spatial coordinates to [-1, 1] ─────────────────
-        R_n = (R_flat - cfg.R0) / cfg.AP
-        Z_n =  Z_flat           / cfg.BP
-        xy  = jnp.stack([R_n, Z_n], axis=-1)        # (N², 2)
+        C = self.n_channels
+        L = self.n_radial
 
-        # ── Field coordinates for field hash ─────────────────────────
-        # psi_n and bpol_n are already in [-1, 1] (normalised in data_loader)
-        field_xy = jnp.stack([psi_n, bpol_n], axis=-1)    # (N², 2)
+        # ── Branch & trunk encoding ───────────────────────────────────
+        b = BranchNet(self.branch_hidden, L, C)(g)         # (L, C)
+        t = TrunkNet(self.trunk_hidden, C)(xi)             # (C,)
 
-        # ── Encode ───────────────────────────────────────────────────
-        hc   = self.hash_coord(xy)        # (N², 32)
-        hf   = self.hash_field(field_xy)  # (N², 16)
-        theta = jnp.arctan2(Z_n, R_n)    # (N²,)
-        so2  = self.so2(theta)            # (N², 8)
+        # ── Merger: pointwise multiply (broadcast t over L) ───────────
+        z = b * t[None, :]                                 # (L, C)
 
-        # ── Shared trunk ─────────────────────────────────────────────
-        trunk = self.trunk(hc, hf, so2)  # (N², 256)  — shared weights
+        # ── Decoder: 1 Fourier + 2 U-Fourier layers ───────────────────
+        z = FourierLayer1D(C, self.n_modes)(z)             # (L, C)
+        z = UFourierLayer1D(C, self.n_modes)(z)            # (L, C)
+        z = UFourierLayer1D(C, self.n_modes)(z)            # (L, C)
 
-        # ── Per-member predictions ────────────────────────────────────
-        preds = jnp.stack(
-            [adapter(trunk) for adapter in self.adapters],
-            axis=0,
-        )                                            # (M, N²)
-
-        mean = jnp.mean(preds, axis=0)               # (N²,)
-        std  = jnp.std( preds, axis=0) + jnp.exp(self.log_noise[0])
-
-        # ── PIGNO refinement on ensemble mean ────────────────────────
-        eps_raw   = mean.reshape(cfg.N_GRID, cfg.N_GRID)
-        eps_pigno = self.pigno(eps_raw, esrc, edst, ew, ndeg)  # (N, N)
-
-        # ── Hard boundary mask (smooth sigmoid at ρ = 1) ─────────────
-        mask    = jax.nn.sigmoid(50.0 * (1.0 - rho_2d))       # (N, N)
-        eps_out = eps_pigno * mask                              # (N, N)
-
-        return eps_out, mean, std, preds
+        # ── Projection to radial profile ──────────────────────────────
+        z     = nn.Dense(64)(z)                            # (L, 64)
+        z     = nn.relu(z)
+        z     = nn.Dense(1)(z)                             # (L, 1)
+        eps1d = nn.sigmoid(z.squeeze(-1))                  # (L,)
+        return eps1d
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 8.  Utilities
+# 6.  Utilities
 # ═══════════════════════════════════════════════════════════════════════
 
 def count_params(params: dict) -> int:
@@ -584,73 +388,80 @@ def count_params(params: dict) -> int:
 
 
 def build_model(
-    R_flat  : jnp.ndarray,
-    Z_flat  : jnp.ndarray,
-    psi_n   : jnp.ndarray,
-    bpol_n  : jnp.ndarray,
-    esrc    : jnp.ndarray,
-    edst    : jnp.ndarray,
-    ew      : jnp.ndarray,
-    ndeg    : jnp.ndarray,
-    rho_2d  : jnp.ndarray,
-    seed    : int = 0,
-    n_members : int = cfg.N_ENS,
+    g        : jnp.ndarray,
+    xi       : jnp.ndarray,
+    seed     : int = 0,
+    branch_hidden : Sequence[int] = (256, 256),
+    trunk_hidden  : Sequence[int] = (64, 128, 128),
+    n_channels    : int = 64,
+    n_modes       : int = 16,
+    n_radial      : int = 128,
 ) -> ModelBundle:
     """
-    Instantiate VICTOR_v6 and initialise parameters with a random key.
+    Instantiate FourierDeepONet and initialise parameters with a random key.
 
     Parameters
     ----------
-    R_flat … rho_2d : example arrays matching the shapes expected at
-        inference time (used only for shape inference — values ignored).
-    seed      : int   PRNGKey seed.
-    n_members : int   Number of ensemble members (default cfg.N_ENS).
+    g             : (n_chords,)  example chord array (used for shape init only).
+    xi            : (9,)         example geometry vector (used for shape init only).
+    seed          : int          PRNGKey seed.
+    branch_hidden : Sequence[int]  Branch MLP hidden widths.
+    trunk_hidden  : Sequence[int]  Trunk MLP hidden widths.
+    n_channels    : int            Latent channel width C.
+    n_modes       : int            Truncated Fourier modes k_max.
+    n_radial      : int            Output radial grid length L.
 
     Returns
     -------
     ModelBundle
-        model  : VICTOR_v6 instance
+        model  : FourierDeepONet instance
         params : initialised parameter tree
     """
-    model  = VICTOR_v6(n_members=n_members)
-    key    = jax.random.PRNGKey(seed)
-    params = model.init(
-        key,
-        R_flat, Z_flat, psi_n, bpol_n,
-        esrc, edst, ew, ndeg, rho_2d,
+    model  = FourierDeepONet(
+        branch_hidden = branch_hidden,
+        trunk_hidden  = trunk_hidden,
+        n_channels    = n_channels,
+        n_modes       = n_modes,
+        n_radial      = n_radial,
     )
+    key    = jax.random.PRNGKey(seed)
+    params = model.init(key, g, xi)
     return ModelBundle(model=model, params=params)
 
 
-def verify_model(bundle: ModelBundle,
-                 R_flat, Z_flat, psi_n, bpol_n,
-                 esrc, edst, ew, ndeg, rho_2d) -> None:
+def verify_model(
+    bundle : ModelBundle,
+    g      : jnp.ndarray,
+    xi     : jnp.ndarray,
+) -> None:
     """
     Run a single forward pass and print a diagnostic summary.
 
-    Checks parameter count, output shapes, and NaN counts.
-    Raises AssertionError if any output contains NaNs.
+    Checks parameter count, output shape, and NaN count.
+    Raises AssertionError if the output contains NaNs.
+
+    Parameters
+    ----------
+    bundle : ModelBundle   (model, params) from build_model().
+    g      : (n_chords,)   normalised chord measurements.
+    xi     : (9,)          WEST GEM geometry/source parameters.
     """
     model, params = bundle
 
-    outputs = model.apply(
-        params,
-        R_flat, Z_flat, psi_n, bpol_n,
-        esrc, edst, ew, ndeg, rho_2d,
-    )
+    eps1d = model.apply(params, g, xi)
 
     n_params  = count_params(params)
-    nan_count = sum(int(jnp.any(jnp.isnan(o))) for o in outputs)
-    shapes    = [o.shape for o in outputs]
+    nan_count = int(jnp.any(jnp.isnan(eps1d)))
 
-    print("── model.py  VICTOR_v6 ─────────────────────────────────")
-    print(f"  Parameters     : {n_params:,}  (target 500k–600k)")
-    print(f"  Output shapes  : {shapes}")
-    print(f"  NaN in outputs : {nan_count}  (must be 0)")
+    print("── model.py  FourierDeepONet ────────────────────────────")
+    print(f"  Parameters     : {n_params:,}")
+    print(f"  Output shape   : {eps1d.shape}  (expect ({model.n_radial},))")
+    print(f"  Output range   : [{float(eps1d.min()):.4f}, {float(eps1d.max()):.4f}]")
+    print(f"  NaN in output  : {nan_count}  (must be 0)")
     print("────────────────────────────────────────────────────────")
 
     assert nan_count == 0, (
-        f"Forward pass produced NaNs in {nan_count} output(s). "
-        "Check hash grid initialisers or SIREN ω₀."
+        "Forward pass produced NaNs. "
+        "Check Fourier layer initialisers or branch/trunk widths."
     )
     print("OK  model.py verified")

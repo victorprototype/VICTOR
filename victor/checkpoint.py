@@ -112,20 +112,12 @@ def build_ckpt_manager(
         max_to_keep        = max_to_keep,
         save_interval_steps= 1,       # we control frequency ourselves
     )
-    # orbax 0.11.x requires an explicit CompositeCheckpointer that registers
-    # each key upfront.  Passing just a directory uses the legacy API which
-    # raises "Unknown key" on save.
-    checkpointer = ocp.CompositeCheckpointer(
-        {
-            CKPT_PARAMS_KEY: ocp.PyTreeCheckpointer(),
-            CKPT_OPT_KEY   : ocp.PyTreeCheckpointer(),
-        },
-        options=options,
-    )
+    # orbax 0.11.x: declare item names upfront so the manager knows the keys.
+    # Use args=ocp.args.Composite(...) at save/restore time (not items=).
     mgr = ocp.CheckpointManager(
         ckpt_dir,
-        checkpointers=checkpointer,
         options=options,
+        item_names=(CKPT_PARAMS_KEY, CKPT_OPT_KEY),
     )
     print(f"CheckpointManager ready: {ckpt_dir}  (max_to_keep={max_to_keep})")
     return mgr
