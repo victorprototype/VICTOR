@@ -1,5 +1,5 @@
 # ============================================================
-# VICTOR v6.0 — trainer.py
+# VICTOR v7.0 — trainer.py
 # Closure-based JIT training step, training loop, stage logic
 # ============================================================
 # Public API
@@ -9,8 +9,20 @@
 #   train_one_profile(step_fn, ...)            -> (params, opt_state, ep_global, best_data)
 #   train(step_fn, ...)                        -> (params, opt_state, hist, best_data)
 #
-# Architecture
-# ------------
+# v7 changes vs v6
+# ----------------
+#  • FourierDeepONet.__call__(g, xi) → eps1d (n_radial,).
+#    The old geometry args (R_flat, Z_flat, psi_n, bpol_n, esrc, edst,
+#    ew, ndeg, rho_2d) are no longer passed through the JIT boundary.
+#  • _step signature reduced to:
+#      (params, opt_state, g_noisy, xi, active_mask, rho_flat)
+#  • train_one_profile and train no longer accept the geometry arrays
+#    that have been removed from the step boundary.
+#  • loss_fn signature updated to match losses.py v7 (no ensemble args).
+#  • Profile dict is expected to carry "xi" (9-D hardware vector).
+#
+# Architecture (unchanged)
+# ------------------------
 #  * tx, model, w_ops, and weights are Python objects — they cannot
 #    cross the JIT boundary as traced values.  They are closed over
 #    inside make_train_step() and never passed at runtime.
@@ -56,7 +68,7 @@ def build_optimizer(
     lr_end      : float = 5e-5,
 ) -> optax.GradientTransformation:
     """
-    Build the VICTOR v6 optimiser: warmup-cosine-decay Adam + grad-clip.
+    Build the VICTOR v7 optimiser: warmup-cosine-decay Adam + grad-clip.
 
     Schedule
     --------
@@ -107,19 +119,17 @@ def make_train_step(
 
     Parameters
     ----------
-    model   : VICTOR_v6 instance
+    model   : FourierDeepONet instance
     w_ops   : WOperators  (geometry.WOperators)
     weights : LossWeights  (default DEFAULT_WEIGHTS)
-    tx      : optax GradientTransformation -- required, closed over.
+    tx      : optax GradientTransformation — required, closed over.
               Do NOT pass tx to the returned step_fn at call time.
 
     Returns
     -------
     step_fn : jit-compiled callable with signature
         step_fn(params, opt_state,
-                g_noisy, psi_n, bpol_n,
-                R_flat, Z_flat, esrc, edst, ew, ndeg,
-                rho_2d, rho_flat, active_mask)
+                g_noisy, xi, active_mask, rho_flat)
         -> (new_params, new_opt_state, total, loss_dict)
     """
     if tx is None:
@@ -133,33 +143,21 @@ def make_train_step(
     def _step(
         params,
         opt_state,
-        g_noisy     : jnp.ndarray,
-        psi_n       : jnp.ndarray,
-        bpol_n      : jnp.ndarray,
-        R_flat      : jnp.ndarray,
-        Z_flat      : jnp.ndarray,
-        esrc        : jnp.ndarray,
-        edst        : jnp.ndarray,
-        ew          : jnp.ndarray,
-        ndeg        : jnp.ndarray,
-        rho_2d      : jnp.ndarray,
-        rho_flat    : jnp.ndarray,
-        active_mask : jnp.ndarray,
+        g_noisy     : jnp.ndarray,   # (n_chords,)
+        xi          : jnp.ndarray,   # (9,)
+        active_mask : jnp.ndarray,   # (128,)
+        rho_flat    : jnp.ndarray,   # (n_radial,)
     ) -> Tuple[dict, object, jnp.ndarray, Dict[str, jnp.ndarray]]:
 
         def _loss(p):
-            eps_out, mean, std, preds = model.apply(
-                p,
-                R_flat, Z_flat, psi_n, bpol_n,
-                esrc, edst, ew, ndeg, rho_2d,
-            )
-            log_noise = p["params"]["log_noise"]
+            # v7: FourierDeepONet(g, xi) → eps1d (n_radial,)
+            eps1d = model.apply(p, g_noisy, xi)
             return loss_fn(
-                eps_out, mean, std, preds,
-                g_noisy, w_ops,
+                eps1d,
+                g_noisy,
+                w_ops,
                 active_mask,
-                rho_2d, rho_flat,
-                log_noise,
+                rho_flat,
                 weights,
             )
 
@@ -189,13 +187,6 @@ def train_one_profile(
     params            : dict,
     opt_state,
     profile           : dict,
-    R_flat            : jnp.ndarray,
-    Z_flat            : jnp.ndarray,
-    esrc              : jnp.ndarray,
-    edst              : jnp.ndarray,
-    ew                : jnp.ndarray,
-    ndeg              : jnp.ndarray,
-    rho_2d            : jnp.ndarray,
     rho_flat          : jnp.ndarray,
     active_mask       : jnp.ndarray,
     inject_noise,
@@ -217,11 +208,13 @@ def train_one_profile(
     Parameters
     ----------
     step_fn      : jit-compiled step function from make_train_step().
-                   tx is already closed over inside step_fn.
+                   tx, model, w_ops are already closed over inside step_fn.
     params       : current param tree (input/output)
     opt_state    : current optimiser state (input/output)
-    profile      : one dict from data_loader.load_profiles()
-    R_flat ... active_mask : geometry arrays from Cell 2 scope
+    profile      : one dict from data_loader.load_profiles().
+                   Must contain keys: "g_ideal", "xi".
+    rho_flat     : (n_radial,)  normalised elliptic radius per radial point
+    active_mask  : (128,)       float32, 1 for active chords
     inject_noise : data_loader.inject_noise
     stages       : list of (n_steps, sigma) from config.STAGES
     ep_global    : global epoch counter at entry
@@ -244,9 +237,8 @@ def train_one_profile(
     if t0 is None:
         t0 = time.time()
 
-    psi_n   = profile["psi_n"]
-    bpol_n  = profile["bpol_n"]
-    g_clean = profile["g_ideal"]
+    g_clean = profile["g_ideal"]   # (n_chords,)
+    xi      = profile["xi"]        # (9,)
 
     for si, (s_ep, s_sig) in enumerate(stages):
 
@@ -266,8 +258,7 @@ def train_one_profile(
 
         print(
             f"  Prof {prof_idx + 1} | stage {si + 1}/{len(stages)} "
-            f"sigma={s_sig}  ep_range=[{ep_start},{s_ep})  "
-            f"Te_core={float(profile['Te_1d'][0]):.2f} keV"
+            f"sigma={s_sig}  ep_range=[{ep_start},{s_ep})"
         )
 
         for ep in range(ep_start, s_ep):
@@ -282,11 +273,8 @@ def train_one_profile(
             # -- Gradient step --------------------------------------------
             params, opt_state, total, ld = step_fn(
                 params, opt_state,
-                g_stage, psi_n, bpol_n,
-                R_flat, Z_flat,
-                esrc, edst, ew, ndeg,
-                rho_2d, rho_flat,
-                active_mask,
+                g_stage, xi,
+                active_mask, rho_flat,
             )
             ep_global += 1
 
@@ -306,13 +294,12 @@ def train_one_profile(
             # -- Logging --------------------------------------------------
             if ep_global % log_every == 0:
                 proj_f  = float(ld.get("proj",   0))
-                nll_f   = float(ld.get("nll",    0))
                 smth_f  = float(ld.get("smooth", 0))
                 elapsed = time.time() - t0
                 print(
                     f"    ep={ep_global:6d} | L={total_f:.5f} | "
-                    f"proj={proj_f:.5f} | nll={nll_f:.5f} | "
-                    f"smooth={smth_f:.5f} | t={elapsed:.0f}s"
+                    f"proj={proj_f:.5f} | smooth={smth_f:.5f} | "
+                    f"t={elapsed:.0f}s"
                 )
 
     return params, opt_state, ep_global, best_data
@@ -328,13 +315,6 @@ def train(
     params       : dict,
     opt_state,
     profiles     : list,
-    R_flat       : jnp.ndarray,
-    Z_flat       : jnp.ndarray,
-    esrc         : jnp.ndarray,
-    edst         : jnp.ndarray,
-    ew           : jnp.ndarray,
-    ndeg         : jnp.ndarray,
-    rho_2d       : jnp.ndarray,
     rho_flat     : jnp.ndarray,
     active_mask  : jnp.ndarray,
     inject_noise,
@@ -359,11 +339,13 @@ def train(
     Parameters
     ----------
     step_fn      : jit-compiled step from make_train_step().
-                   tx is already closed over inside step_fn.
+                   tx, model, w_ops are already closed over inside step_fn.
     params       : initial / resumed param tree
     opt_state    : initial / resumed optimiser state
-    profiles     : list of profile dicts from data_loader.load_profiles()
-    R_flat ... active_mask : geometry arrays (from Cell 2)
+    profiles     : list of profile dicts from data_loader.load_profiles().
+                   Each dict must contain keys: "g_ideal", "xi".
+    rho_flat     : (n_radial,)  normalised elliptic radius per radial point
+    active_mask  : (128,)       float32, 1 for active chords
     inject_noise : data_loader.inject_noise
     stages       : list of (n_steps, sigma) tuples (default cfg.STAGES)
     ep_global    : starting global epoch (0 for fresh, >0 for resume)
@@ -391,7 +373,7 @@ def train(
     n_stages = len(stages)
     total_planned = sum(s for s, _ in stages) * n_prof
     print(f"\n{'='*60}")
-    print(f"VICTOR v6.0 -- Training  ({n_prof} profiles x {n_stages} stages)")
+    print(f"VICTOR v7.0 -- Training  ({n_prof} profiles x {n_stages} stages)")
     print(f"  Total planned steps : {total_planned:,}")
     print(f"  Resume: prof={start_prof}  stage={start_stage}  ep={ep_global}")
     print(f"{'='*60}\n")
@@ -406,13 +388,6 @@ def train(
             params            = params,
             opt_state         = opt_state,
             profile           = profiles[pi],
-            R_flat            = R_flat,
-            Z_flat            = Z_flat,
-            esrc              = esrc,
-            edst              = edst,
-            ew                = ew,
-            ndeg              = ndeg,
-            rho_2d            = rho_2d,
             rho_flat          = rho_flat,
             active_mask       = active_mask,
             inject_noise      = inject_noise,
@@ -429,7 +404,7 @@ def train(
             t0                = t0,
         )
 
-        # After first profile, resume offsets are consumed -- start fresh
+        # After first profile, resume offsets are consumed — start fresh
         _start_stage = 0
         _start_ep    = 0
 
@@ -463,5 +438,5 @@ def _append(hist: dict, key: str, value: float) -> None:
 # -- Module self-test ----------------------------------------------------
 
 if __name__ == "__main__":
-    print("trainer.py -- no self-test (requires full pipeline).")
+    print("trainer.py — no self-test (requires full pipeline).")
     print("Run Cell 5 in the notebook to exercise the training loop.")
