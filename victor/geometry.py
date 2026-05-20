@@ -1,5 +1,5 @@
 # ============================================================
-# VICTOR v6.0 — geometry.py
+# VICTOR v7.0 — geometry.py
 # Pixel grids, ray coordinates, rho-proximity graph,
 # and W matrix-free matvec / vecmat operators.
 # ============================================================
@@ -28,11 +28,12 @@ from victor import config as cfg
 
 class PixelGrids(NamedTuple):
     """All per-pixel geometry arrays, shape (N_GRID*N_GRID,) unless noted."""
-    RHO_2D   : jnp.ndarray   # (N_GRID, N_GRID)  normalised elliptic radius
-    RHO_FLAT : jnp.ndarray   # (N_GRID²,)
-    THETA_FLAT: jnp.ndarray  # (N_GRID²,)  atan2(Y, X)
-    R_PIX    : jnp.ndarray   # (N_GRID²,)  major radius of each pixel [m]
-    Z_PIX    : jnp.ndarray   # (N_GRID²,)  vertical position of each pixel [m]
+    RHO_2D    : jnp.ndarray   # (N_GRID, N_GRID)  normalised elliptic radius
+    RHO_FLAT  : jnp.ndarray   # (N_GRID²,)        ρ at every pixel (2-D grid)
+    THETA_FLAT: jnp.ndarray   # (N_GRID²,)        atan2(Y, X)
+    R_PIX     : jnp.ndarray   # (N_GRID²,)        major radius of each pixel [m]
+    Z_PIX     : jnp.ndarray   # (N_GRID²,)        vertical position of each pixel [m]
+    RHO_RADIAL: jnp.ndarray   # (N_RADIAL,)       1-D radial axis for FourierDeepONet output
 
 
 class RayArrays(NamedTuple):
@@ -77,10 +78,13 @@ def build_pixel_grids(
     -------
     PixelGrids
         RHO_2D    : (n_grid, n_grid) normalised elliptic radius ρ = √[(x/ap)²+(y/bp)²]
-        RHO_FLAT  : (n_grid²,)
-        THETA_FLAT: (n_grid²,)  arctan2(y, x)
-        R_PIX     : (n_grid²,)  R = r0 + x   [m]
-        Z_PIX     : (n_grid²,)  Z = y          [m]
+        RHO_FLAT  : (n_grid²,)       ρ at every pixel (for 2-D reconstruction)
+        THETA_FLAT: (n_grid²,)       arctan2(y, x)
+        R_PIX     : (n_grid²,)       R = r0 + x   [m]
+        Z_PIX     : (n_grid²,)       Z = y         [m]
+        RHO_RADIAL: (N_RADIAL,)      uniform 1-D radial axis [0, RHO_MAX]
+                                     matches FourierDeepONet output length;
+                                     used by loss_boundary / loss_smoothness.
     """
     lin       = np.linspace(-ext, ext, n_grid)
     XX, YY    = np.meshgrid(lin, lin)
@@ -96,6 +100,7 @@ def build_pixel_grids(
         THETA_FLAT= jnp.array(theta_np),
         R_PIX     = jnp.array(r_pix_np),
         Z_PIX     = jnp.array(z_pix_np),
+        RHO_RADIAL= jnp.linspace(0.0, cfg.RHO_MAX, cfg.N_RADIAL, dtype=jnp.float32),
     )
 
 
@@ -339,7 +344,7 @@ def build_all_geometry(W_csr=None):
     """
     print("Building pixel grids...")
     grids = build_pixel_grids()
-    print(f"  RHO_2D={grids.RHO_2D.shape}  R_PIX={grids.R_PIX.shape}")
+    print(f"  RHO_2D={grids.RHO_2D.shape}  R_PIX={grids.R_PIX.shape}  RHO_RADIAL={grids.RHO_RADIAL.shape}")
 
     print("Building WEST ray coords...")
     rays = build_ray_coords()

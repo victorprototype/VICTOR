@@ -1,12 +1,19 @@
 # ============================================================
-# VICTOR v6.0 — config.py
-# All project constants: grid, hash, ensemble, training, paths
+# VICTOR v7.0 — config.py
+# All project constants: grid, FourierDeepONet, training, paths
 # ============================================================
 # Usage:
 #   from victor import config as cfg
-#   cfg.N_GRID, cfg.R0, cfg.T_COORD, ...
+#   cfg.N_GRID, cfg.R0, cfg.N_RADIAL, ...
 #
-# Centralized project configuration shared across all VICTOR modules.
+# v7 changes vs v6
+# ----------------
+#  • Added N_RADIAL  : radial output length of FourierDeepONet (128)
+#  • Added RHO_MAX   : radial grid upper bound (1.2, slightly beyond LCFS)
+#  • Removed T_COORD, T_FIELD, L_HASH, F_HASH  (hash grid — v6 only)
+#  • Removed N_ENS                              (ensemble — v6 only)
+#  • Removed PIGNO_LAYERS, PIGNO_HIDDEN         (PIGNO — v6 only)
+#  • summary() updated to reflect v7 fields
 # ============================================================
 
 import os
@@ -18,18 +25,9 @@ R0      = 2.5       # major radius of grid centre [m]
 AP      = 0.5       # semi-axis in R (ellipse normalisation)
 BP      = 0.65      # semi-axis in Z (ellipse normalisation)
 
-# ── Hash grid ────────────────────────────────────────────────
-T_COORD = 8192      # hash table size  — coordinate hash
-T_FIELD = 4096      # hash table size  — field quantity hash
-L_HASH  = 16        # number of resolution levels
-F_HASH  = 2         # features per level
-
-# ── Ensemble ─────────────────────────────────────────────────
-N_ENS   = 5         # number of ensemble members
-
-# ── PIGNO ────────────────────────────────────────────────────
-PIGNO_LAYERS = 2
-PIGNO_HIDDEN = 96
+# ── Radial output grid (FourierDeepONet) ─────────────────────
+N_RADIAL = 128      # radial output points of FourierDeepONet
+RHO_MAX  = 1.2      # upper bound of radial axis (beyond LCFS at ρ=1)
 
 # ── Training ─────────────────────────────────────────────────
 N_EPOCHS   = 10_000
@@ -38,7 +36,6 @@ SAVE_EVERY = 50
 LOG_EVERY  = 200
 
 # Noise stages: list of (n_steps, sigma_fraction) tuples
-# Three progressive noise levels over the full training run
 STAGES = [
     (N_EPOCHS // 3,              0.001),
     (N_EPOCHS // 3,              0.003),
@@ -48,7 +45,7 @@ STAGES = [
 # ── Profiles ─────────────────────────────────────────────────
 N_PROFILES = 10     # number of TORAX equilibrium profiles to load
 
-# ── rho-graph (PIGNO adjacency) ──────────────────────────────
+# ── rho-graph (geometry adjacency) ──────────────────────────
 RHO_GRAPH_N_NB   = 6      # k-nearest neighbours in rho-space
 RHO_GRAPH_SIGMA  = 0.04   # RBF bandwidth
 RHO_GRAPH_STRIDE = 4      # sub-sample stride for graph building
@@ -63,7 +60,6 @@ DS_MAX_FACTOR = 0.5        # ds_max = (2*EXT/N_GRID) * DS_MAX_FACTOR
 DS_MIN_FACTOR = 0.5        # ds_min = ds_max * DS_MIN_FACTOR
 
 # ── Paths ─────────────────────────────────────────────────────
-# Repo-relative default paths (overrideable via environment variables).
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 DATASET_DIR = os.environ.get(
@@ -82,16 +78,14 @@ RESULTS_DIR = os.environ.get(
 )
 
 
-
-
 def summary() -> None:
     """Print a compact summary of all active constants."""
     print("── config.py ───────────────────────────────────────────")
     print(f"  Grid     : {N_GRID}×{N_GRID}  EXT={EXT}  R0={R0}  AP={AP}  BP={BP}")
-    print(f"  HashGrid : T_coord={T_COORD}  T_field={T_FIELD}  L={L_HASH}  F={F_HASH}")
-    print(f"  Ensemble : N={N_ENS}  Profiles={N_PROFILES}")
+    print(f"  Radial   : N_RADIAL={N_RADIAL}  RHO_MAX={RHO_MAX}")
     print(f"  Training : epochs={N_EPOCHS}  LR={LR}  save={SAVE_EVERY}  log={LOG_EVERY}")
     print(f"  Stages   : {STAGES}")
+    print(f"  Profiles : {N_PROFILES}")
     print(f"  Paths    : dataset={DATASET_DIR}")
     print(f"             ckpt={CKPT_DIR}")
     print("────────────────────────────────────────────────────────")
