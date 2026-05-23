@@ -1,19 +1,13 @@
 # ============================================================
 # VICTOR v6.0 — Cell 2: Load W matrix + geometry + profiles
 # ============================================================
-# Depends on Cell 1 (installs, Drive mount, MODULES_DIR on sys.path).
+# Depends on Cell 1 (runtime setup + package imports complete).
 # Calls: geometry.py, data_loader.py, config.py
 # ============================================================
 
-# ── Reload modules (picks up any Drive edits) ───────────────
-modules = load_modules(force_reload=True)
+# ── Package aliases ──────────────────────────────────────────
+geom = geometry
 
-cfg         = modules["config"]
-geom        = modules["geometry"]
-data_loader = modules["data_loader"]
-
-# ── Propagate Drive path into config ────────────────────────
-cfg.update_paths(DRIVE)
 
 # ── Load W matrix ────────────────────────────────────────────
 w_bundle = data_loader.load_W_matrix()
