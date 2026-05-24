@@ -74,3 +74,12 @@ W_POLAR    = 0.001          # poloidal harmonic regularisation (NEW v8)
 DATASET_DIR  = os.environ.get("VICTOR_DATA", "/data/victor")
 CKPT_DIR     = os.environ.get("VICTOR_CKPT", "/checkpoints/victor_v8")
 RESULTS_DIR  = os.environ.get("VICTOR_RESULTS", "/results/victor_v8")
+def summary():
+    """Print a summary of all VICTOR v8 config constants."""
+    import victor.config as _c
+    print("── VICTOR v8 config ─────────────────────────────────────")
+    for k, v in vars(_c).items():
+        if k.startswith("_") or callable(v) or isinstance(v, type):
+            continue
+        print(f"  {k:<22}: {v}")
+    print("─────────────────────────────────────────────────────────")
