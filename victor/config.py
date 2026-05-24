@@ -71,7 +71,7 @@ W_POLAR    = 0.001          # poloidal harmonic regularisation (NEW v8)
 # PDE and positivity disabled in v8 (handled by softplus + clip)
 
 # ── Dataset ───────────────────────────────────────────────────────────
-DATASET_DIR  = os.environ.get("VICTOR_DATA", "/data/victor_dataset")
+DATASET_DIR  = os.environ.get("VICTOR_DATA", "/VICTOR/victor_dataset")
 CKPT_DIR     = os.environ.get("VICTOR_CKPT", "/checkpoints/victor_v8")
 RESULTS_DIR  = os.environ.get("VICTOR_RESULTS", "/results/victor_v8")
 def summary():
