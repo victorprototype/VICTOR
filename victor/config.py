@@ -38,16 +38,16 @@ N_EQ_CHANNELS = 2   # currently psi_2d + rho_2d
                     # increment here to add Te, ne, q later — no other file changes needed
 
 # ── Training ─────────────────────────────────────────────────
-N_EPOCHS   = 10_000
-LR         = 3e-4
-SAVE_EVERY = 50
+N_EPOCHS   = 20_000
+LR         = 1e-4
+SAVE_EVERY = 200
 LOG_EVERY  = 200
 
 # Noise stages: list of (n_steps, sigma_fraction) tuples
 STAGES = [
-    (N_EPOCHS // 3,              0.001),
-    (N_EPOCHS // 3,              0.003),
-    (N_EPOCHS - 2*(N_EPOCHS//3), 0.008),
+    (5_000,  0.001),
+    (8_000,  0.003),
+    (7_000,  0.008),
 ]
 
 # ── Profiles ─────────────────────────────────────────────────
