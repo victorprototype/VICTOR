@@ -40,7 +40,7 @@ N_EQ_CHANNELS = 2   # currently psi_2d + rho_2d
 # ── Training ─────────────────────────────────────────────────
 N_EPOCHS   = 20_000
 LR         = 1e-4
-SAVE_EVERY = 200
+SAVE_EVERY = 2000
 LOG_EVERY  = 200
 
 # Noise stages: list of (n_steps, sigma_fraction) tuples
