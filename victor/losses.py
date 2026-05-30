@@ -285,17 +285,13 @@ class LossWeights(NamedTuple):
     w_mono            : radial monotonicity penalty   — v8.2 new (L_I ext.)
     """
     w_proj            : float = 1.0
-    w_boundary        : float = 1.0    # v8.1: reduced from 5.0
+    w_boundary        : float = 0.05   # was 1.0 — trivially zero, reduce
     w_smooth          : float = 0.02
-    w_positivity      : float = 0.1    # v8.1: reduced from 0.5
-    # v8.2: w_pde raised from 0.05 → 0.5 to bring the PDE physics term
-    # (L_I, PINN §3.3) to coequal status with the projection loss (Lf).
-    w_pde             : float = 0.5    # v8.2: was 0.05
+    w_positivity      : float = 0.01   # was 0.1 — trivially zero, reduce
+    w_pde             : float = 0.5
     w_pol             : float = 0.001
-    # v8.2: new terms
-    w_boundary_colloc : float = 2.0    # v8.2: 2× global mask weight (L_B §3.2)
-    w_mono            : float = 0.1    # v8.2: radial monotonicity (L_I ext.)
-
+    w_boundary_colloc : float = 0.1    # was 2.0 — was exploding to 109
+    w_mono            : float = 0.01   # was 0.1 — trivially zero, reduce
 
 # Singleton default weights
 DEFAULT_WEIGHTS = LossWeights()
@@ -623,8 +619,8 @@ def _adaptive_combine(
     log_vars   : Dict[str, jnp.ndarray],
     weights    : LossWeights,
     beta       : float = 0.5,
-    s_min      : float = -4.0,
-    s_max      : float = 4.0,
+    s_min      : float = -2.0,
+    s_max      : float = 2.0,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
     Combine loss components using lbPINN dynamic weighting.
