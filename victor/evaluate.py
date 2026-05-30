@@ -863,11 +863,13 @@ def plot_gradient_flow(
             grids.RHO_FLAT,
             grids.THETA_FLAT,
             grids.RHO_RADIAL,
+            lerp_idx_lo = prof["lerp_idx_lo"],
+            lerp_idx_hi = prof["lerp_idx_hi"],
+            lerp_frac   = prof["lerp_frac"],
         )
         g_pred  = w_bundle.w_ops.matvec(eps)
         residual = (g_pred - prof['g_ideal']) * w_bundle.ACTIVE_MASK.astype(jnp.float32)
         return jnp.sum(residual ** 2) / jnp.maximum(w_bundle.ACTIVE_MASK.sum(), 1.0)
-
     # Accumulate gradient norms per leaf path
     norm_accum: Dict[str, List[float]] = {}
 
