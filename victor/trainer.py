@@ -512,7 +512,7 @@ def make_train_step(
             lerp_idx_lo    = lerp_idx_lo,
             lerp_idx_hi    = lerp_idx_hi,
             lerp_frac      = lerp_frac,
-            boundary_colloc= boundary_colloc,
+            boundary_colloc_idx= boundary_colloc,
         )
 
     # ── batched loss: vmap over B samples ─────────────────────────────
