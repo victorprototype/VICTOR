@@ -621,57 +621,29 @@ def _adaptive_combine(
     beta       : float = 0.5,
     s_min      : float = -2.0,
     s_max      : float = 2.0,
+    L_threshold: float = 1e-4,
+    L_init     : float = 1e-2,
+    norm_clip  : float = 5.0,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
-    Combine loss components using lbPINN dynamic weighting.
+    Combine loss components using blended lbPINN + GradNorm-style weighting.
 
-    Implements Kendall et al. 2018 homoscedastic uncertainty weighting
-    with a softplus regulariser instead of raw log(sigma) to prevent
-    gradient explosion at sigma → 0:
-
-        L_total = Σ_i  exp(-s_i) * w_i * L_i  +  beta * softplus(s_i)
-
-    where:
-        s_i  = log(sigma_i^2)  — learned log-variance (JAX scalar)
-        w_i  = fixed prior weight from LossWeights
-        beta = regulariser strength (default 0.5)
-
-    The softplus(s_i) regulariser is always positive and never blows up,
-    unlike raw s_i which can push s toward -inf to artificially suppress
-    the uncertainty regularisation.
-
-    Gradient explosion prevention
-    ------------------------------
-    s_i is clamped to [s_min, s_max] = [-4, +4] before exponentiation.
-        exp(-s_min) = e^4  ≈  54.6   (max boost any component gets)
-        exp(-s_max) = e^{-4} ≈ 0.018 (max suppression)
-    This removes the unbounded amplification in the v7.1 implementation
-    (which clamped to [-5, 5] → e^5 ≈ 148 max boost).
-
-    v8.2: weight_map extended with "boundary_colloc" and "mono" entries.
-
-    Parameters
-    ----------
-    components : dict  {name: scalar loss value}
-    log_vars   : dict  {name: scalar JAX array log-variance (learned)}
-    weights    : LossWeights  fixed prior scales
-    beta       : float  softplus regulariser coefficient (default 0.5)
-    s_min      : float  lower clamp on s_i (default -4.0)
-    s_max      : float  upper clamp on s_i (default +4.0)
-
-    Returns
-    -------
-    total      : scalar float32  weighted total loss
-    w_eff_dict : dict {f"w_eff_{name}": effective weight} for diagnostics
+    Blends two strategies:
+      Option 1 — Threshold gating: terms below L_threshold are trivially
+                 satisfied; their sigma is frozen at 0 (fixed weight) so
+                 they cannot hijack the gradient budget.
+      Option 2 — Loss-normalized weighting: active terms adapt relative
+                 to their own initial scale (L_init / L_current), so
+                 proj and pde balance properly even on different scales.
     """
     weight_map = {
         "proj"            : weights.w_proj,
         "boundary"        : weights.w_boundary,
-        "boundary_colloc" : weights.w_boundary_colloc,  # v8.2 new
+        "boundary_colloc" : weights.w_boundary_colloc,
         "smooth"          : weights.w_smooth,
         "positivity"      : weights.w_positivity,
         "pde"             : weights.w_pde,
-        "mono"            : weights.w_mono,              # v8.2 new
+        "mono"            : weights.w_mono,
         "pol"             : weights.w_pol,
     }
     total = jnp.zeros(())
@@ -679,15 +651,24 @@ def _adaptive_combine(
 
     for name, L in components.items():
         w = weight_map.get(name, 1.0)
-        # Retrieve s_i; fall back to 0.0 if key absent
+
         s_raw = log_vars.get(name, jnp.zeros(()))
         s     = jnp.clip(jnp.asarray(s_raw, dtype=jnp.float32), s_min, s_max)
+        s     = jnp.where(L > L_threshold, s, jnp.zeros_like(s))
 
-        precision   = jnp.exp(-s)                    # effective precision weight
-        regulariser = beta * jax.nn.softplus(s)      # smooth, strictly-positive reg
+        precision_base = jnp.exp(-s)
+        norm_factor    = jnp.clip(
+            L_init / jnp.maximum(L, 1e-8),
+            1.0 / norm_clip,
+            norm_clip,
+        )
+        norm_factor  = jnp.where(L > L_threshold, norm_factor, jnp.ones_like(norm_factor))
+        precision    = precision_base * norm_factor
 
-        total      = total + precision * w * L + regulariser
-        w_eff[f"w_eff_{name}"] = precision * w       # for diagnostics
+        regulariser  = beta * jax.nn.softplus(s)
+
+        total        = total + precision * w * L + regulariser
+        w_eff[f"w_eff_{name}"] = precision * w
 
     return total, w_eff
 
