@@ -660,8 +660,10 @@ def compute_flux_angle(
     )
 
     # ── 4. Interpolate ψ onto pixel grid ─────────────────────────────────
-    query      = np.stack([R_flat, Z_flat], axis=-1)   # (N², 2)
-    psi_pixel  = psi_interp(query).astype(np.float32)  # (N²,)
+    R_flat_1d  = np.array(R_flat).ravel()
+    Z_flat_1d  = np.array(Z_flat).ravel()
+    query      = np.stack([R_flat_1d, Z_flat_1d], axis=-1)   # (N², 2)
+    psi_pixel  = psi_interp(query).astype(np.float32)         # (N²,)
 
     # ── 5. Find magnetic axis (minimum ψ) ────────────────────────────────
     axis_idx = np.unravel_index(np.argmin(psi_smooth), psi_smooth.shape)
@@ -729,12 +731,12 @@ def compute_flux_angle(
         return (np.arctan2(Z_flat - Z_axis, R_flat - R_axis) % (2*np.pi)).astype(np.float32)
 
     psi_keys   = np.array(sorted(contour_table.keys()))   # (n_psi,)
-    theta_flux = np.zeros(len(R_flat), dtype=np.float32)
+    theta_flux = np.zeros(len(R_flat_1d), dtype=np.float32)
 
-    for j_start in range(0, len(R_flat), 512):
-        j_end    = min(j_start + 512, len(R_flat))
-        R_chunk  = R_flat[j_start:j_end]
-        Z_chunk  = Z_flat[j_start:j_end]
+    for j_start in range(0, len(R_flat_1d), 512):
+        j_end    = min(j_start + 512, len(R_flat_1d))
+        R_chunk  = R_flat_1d[j_start:j_end]
+        Z_chunk  = Z_flat_1d[j_start:j_end]
         psi_chunk= psi_pixel[j_start:j_end]
 
         # Find nearest flux surface level for each pixel in chunk
