@@ -681,13 +681,16 @@ def compute_flux_angle(
     # Build lookup: psi_level → (contour_R, contour_Z, theta_star)
     contour_table = {}   # psi_level → (pts (M,2), theta_star (M,))
 
-    for level, collection in zip(psi_levels, cs.collections):
-        paths = collection.get_paths()
-        if not paths:
+    for i, level in enumerate(psi_levels):
+        try:
+            segs = cs.allsegs[i]   # list of (M, 2) arrays for this level
+        except (AttributeError, IndexError):
             continue
-        # Keep only the longest contour (main plasma boundary)
-        path = max(paths, key=lambda p: len(p.vertices))
-        pts  = path.vertices.astype(np.float64)   # (M, 2): col0=R, col1=Z
+        if not segs:
+            continue
+        # Keep longest segment
+        pts = np.array(max(segs, key=len))        # (M, 2): col0=R, col1=Z
+        
 
         if len(pts) < 4:
             continue
