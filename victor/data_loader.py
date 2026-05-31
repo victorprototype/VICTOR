@@ -76,6 +76,7 @@ from jax.experimental.sparse import BCOO
 
 from victor import config as cfg
 from victor import geometry as geom
+from victor import geometry
 
 
 # ── Default WEST GEM hardware vector (9-D, normalised) ───────────────
