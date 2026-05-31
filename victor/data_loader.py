@@ -515,6 +515,21 @@ def load_profiles(
         psi_grid  = interp_field(psi_raw,  R_g, Z_g, R_pix_np, Z_pix_np)
         bpol_grid = interp_field(Bpol_raw, R_g, Z_g, R_pix_np, Z_pix_np)
 
+        # ── Flux-surface-following angle (Grad-Shafranov geometry) ───
+        # Precomputed once per profile — replaces geometric theta in
+        # build_eps2d for physically correct poloidal decomposition.
+        theta_flux_np = geometry.compute_flux_angle(
+            psi_2d  = psi_raw.astype(np.float64),
+            R_grid  = R_g.astype(np.float64),
+            Z_grid  = Z_g.astype(np.float64),
+            R_flat  = R_pix_np.astype(np.float64),
+            Z_flat  = Z_pix_np.astype(np.float64),
+        )
+        flux_bin_idx_np = geometry.compute_flux_surface_bins(
+            psi_flat = np.array(_safe_norm_11(psi_grid).flatten()),
+            rho_flat = np.array(grids.RHO_FLAT),
+        )
+
         # ── Stacked equilibrium channels ─────────────────────────────
         # eq_channels is the primary equilibrium input to the encoder.
         # Individual psi_n / bpol_n are retained for backward compat
@@ -561,6 +576,10 @@ def load_profiles(
             # and penalises any non-zero predicted emissivity outside
             # the last closed flux surface.
             boundary_colloc = boundary_colloc,   # (PDE_COLLOC_N,) int32
+
+            # Flux-surface geometry (Grad-Shafranov precomputed)
+            theta_flux   = _put(theta_flux_np),          # (N²,) float32
+            flux_bin_idx = jnp.array(flux_bin_idx_np),   # (N²,) int32
 
             # ── Python scalars ────────────────────────────────────────
             g_scale = g_max,        # sinogram peak before normalisation

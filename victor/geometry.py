@@ -594,3 +594,202 @@ def build_all_geometry(W_csr=None, device=None):
         print(f"    W_IDX={w_ops.W_IDX.shape}  MX={w_ops.W_IDX.shape[1]}")
 
     return grids, rays, rho_graph, w_ops
+
+# =======================================================================
+# Flux-surface-following poloidal angle  (Grad-Shafranov geometry)
+# =======================================================================
+
+def compute_flux_angle(
+    psi_2d   : np.ndarray,    # (NR, NZ) poloidal flux on equilibrium grid
+    R_grid   : np.ndarray,    # (NR,)    R coordinates
+    Z_grid   : np.ndarray,    # (NZ,)    Z coordinates
+    R_flat   : np.ndarray,    # (N_GRID²,) pixel R coordinates
+    Z_flat   : np.ndarray,    # (N_GRID²,) pixel Z coordinates
+    n_theta  : int   = 128,   # contour integration resolution
+    n_psi    : int   = 48,    # number of flux surface levels
+) -> np.ndarray:              # (N_GRID²,) float32 ∈ [0, 2π)
+    """
+    Compute the flux-surface-following poloidal angle θ* for each pixel.
+
+    Uses the Grad-Shafranov flux function ψ(R,Z) to define flux surfaces
+    (ψ=const contours) and integrates arc length weighted by 1/|∇ψ| along
+    each contour to obtain the straight field line angle θ*.
+
+    This replaces the geometric angle θ=arctan(Z/R) in build_eps2d,
+    ensuring that harmonic decomposition follows actual flux surface
+    geometry (elongation, triangularity, Shafranov shift).
+
+    Parameters
+    ----------
+    psi_2d  : (NR, NZ)    poloidal flux ψ(R,Z) from TORAX
+    R_grid  : (NR,)       R coordinates [m]
+    Z_grid  : (NZ,)       Z coordinates [m]
+    R_flat  : (N_GRID²,)  pixel R values
+    Z_flat  : (N_GRID²,)  pixel Z values
+    n_theta : int         integration points along each contour
+    n_psi   : int         number of flux surface levels
+
+    Returns
+    -------
+    theta_flux : (N_GRID²,) float32  straight field line angle ∈ [0, 2π)
+    """
+    from scipy.interpolate import RegularGridInterpolator
+    from scipy.ndimage import gaussian_filter
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    # ── 1. Smooth ψ to reduce finite-difference noise ────────────────────
+    psi_smooth = gaussian_filter(psi_2d.astype(np.float64), sigma=1.0)
+
+    # ── 2. Compute ∇ψ on equilibrium grid ────────────────────────────────
+    dR = float(R_grid[1] - R_grid[0])
+    dZ = float(Z_grid[1] - Z_grid[0])
+    dpsi_dR      = np.gradient(psi_smooth, dR, axis=0)
+    dpsi_dZ      = np.gradient(psi_smooth, dZ, axis=1)
+    grad_psi_mag = np.sqrt(dpsi_dR**2 + dpsi_dZ**2) + 1e-10
+
+    # ── 3. Interpolators for ψ and |∇ψ| ──────────────────────────────────
+    psi_interp  = RegularGridInterpolator(
+        (R_grid, Z_grid), psi_smooth,
+        method='linear', bounds_error=False, fill_value=None
+    )
+    grad_interp = RegularGridInterpolator(
+        (R_grid, Z_grid), grad_psi_mag,
+        method='linear', bounds_error=False, fill_value=1.0
+    )
+
+    # ── 4. Interpolate ψ onto pixel grid ─────────────────────────────────
+    query      = np.stack([R_flat, Z_flat], axis=-1)   # (N², 2)
+    psi_pixel  = psi_interp(query).astype(np.float32)  # (N²,)
+
+    # ── 5. Find magnetic axis (minimum ψ) ────────────────────────────────
+    axis_idx = np.unravel_index(np.argmin(psi_smooth), psi_smooth.shape)
+    R_axis   = float(R_grid[axis_idx[0]])
+    Z_axis   = float(Z_grid[axis_idx[1]])
+
+    # ── 6. Define flux surface levels ────────────────────────────────────
+    psi_min    = float(psi_smooth.min())
+    psi_lcfs   = float(psi_smooth.max()) * 0.95
+    psi_levels = np.linspace(psi_min + 1e-4, psi_lcfs, n_psi)
+
+    # ── 7. Extract contours and compute θ* via arc-length integration ────
+    fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+    cs = ax.contour(R_grid, Z_grid, psi_smooth.T, levels=psi_levels)
+    plt.close(fig)
+
+    # Build lookup: psi_level → (contour_R, contour_Z, theta_star)
+    contour_table = {}   # psi_level → (pts (M,2), theta_star (M,))
+
+    for level, collection in zip(psi_levels, cs.collections):
+        paths = collection.get_paths()
+        if not paths:
+            continue
+        # Keep only the longest contour (main plasma boundary)
+        path = max(paths, key=lambda p: len(p.vertices))
+        pts  = path.vertices.astype(np.float64)   # (M, 2): col0=R, col1=Z
+
+        if len(pts) < 4:
+            continue
+
+        # Interpolate |∇ψ| at contour points — vectorized
+        grad_c = grad_interp(pts)                  # (M,)
+
+        # Arc length elements — vectorized
+        dpts = np.diff(pts, axis=0)                # (M-1, 2)
+        dl   = np.sqrt((dpts**2).sum(axis=1))      # (M-1,)
+
+        # Straight field line weight: 1/|∇ψ| averaged between adjacent pts
+        w_avg     = 0.5 * (grad_c[:-1] + grad_c[1:])
+        integrand = dl / (w_avg + 1e-10)           # (M-1,)
+
+        cumulative = np.concatenate([[0.0], np.cumsum(integrand)])  # (M,)
+        total      = cumulative[-1]
+        if total < 1e-10:
+            continue
+
+        # Normalize to [0, 2π]
+        theta_c = 2.0 * np.pi * cumulative / total  # (M,)
+
+        # Set θ*=0 at outboard midplane (max R, Z≈Z_axis)
+        # Find point with max R that is closest to Z=Z_axis
+        outboard_score = (pts[:, 0] - R_axis) - 10.0 * np.abs(pts[:, 1] - Z_axis)
+        ref_idx        = np.argmax(outboard_score)
+        theta_c        = (theta_c - theta_c[ref_idx]) % (2.0 * np.pi)
+
+        contour_table[level] = (pts, theta_c)
+
+    # ── 8. Assign θ* to each pixel — fully vectorized ────────────────────
+    if not contour_table:
+        # Fallback to geometric angle if no contours found
+        print("WARNING: compute_flux_angle — no contours found, using geometric angle")
+        return (np.arctan2(Z_flat - Z_axis, R_flat - R_axis) % (2*np.pi)).astype(np.float32)
+
+    psi_keys   = np.array(sorted(contour_table.keys()))   # (n_psi,)
+    theta_flux = np.zeros(len(R_flat), dtype=np.float32)
+
+    for j_start in range(0, len(R_flat), 512):
+        j_end    = min(j_start + 512, len(R_flat))
+        R_chunk  = R_flat[j_start:j_end]
+        Z_chunk  = Z_flat[j_start:j_end]
+        psi_chunk= psi_pixel[j_start:j_end]
+
+        # Find nearest flux surface level for each pixel in chunk
+        # Vectorized: (chunk, n_psi) distance matrix
+        nearest_idx = np.argmin(
+            np.abs(psi_chunk[:, None] - psi_keys[None, :]), axis=1
+        )  # (chunk,)
+
+        for k in np.unique(nearest_idx):
+            mask_k       = nearest_idx == k
+            pts_k, th_k  = contour_table[psi_keys[k]]
+            R_k          = R_chunk[mask_k]
+            Z_k          = Z_chunk[mask_k]
+
+            # Vectorized nearest-point on contour: (pixels, contour_pts)
+            dist2 = (
+                (R_k[:, None] - pts_k[None, :, 0])**2 +
+                (Z_k[:, None] - pts_k[None, :, 1])**2
+            )  # (pixels_in_group, M)
+            nn_idx = np.argmin(dist2, axis=1)   # (pixels_in_group,)
+            theta_flux[j_start:j_end][mask_k] = th_k[nn_idx].astype(np.float32)
+
+    return theta_flux
+
+
+def compute_flux_surface_bins(
+    psi_flat : np.ndarray,   # (N_GRID²,) normalised flux ψ ∈ [-1, 1]
+    rho_flat : np.ndarray,   # (N_GRID²,) normalised radius
+    n_bins   : int = 32,     # number of flux surface bins
+) -> np.ndarray:             # (N_GRID²,) int32 bin index, -1 = outside
+    """
+    Precompute flux surface bin membership for each pixel.
+
+    Assigns each interior pixel (rho < 1.0) to one of n_bins flux surface
+    bins based on its normalised ψ value.  Pixels outside the LCFS are
+    assigned -1.
+
+    Storing this precomputed array in the profile dict and passing it to
+    loss_flux_surface() avoids recomputing bin membership every training
+    step, making the loss ~20x faster.
+
+    Parameters
+    ----------
+    psi_flat : (N_GRID²,)  normalised poloidal flux ∈ [-1, 1]
+    rho_flat : (N_GRID²,)  normalised radius (from geometry.PixelGrids)
+    n_bins   : int         number of flux surface bins
+
+    Returns
+    -------
+    bin_idx : (N_GRID²,) int32  bin index ∈ [0, n_bins-1], -1 = outside LCFS
+    """
+    psi_norm = ((psi_flat + 1.0) / 2.0).astype(np.float32)   # → [0, 1]
+    interior = rho_flat < 1.0
+    bin_idx  = np.full(len(psi_flat), -1, dtype=np.int32)
+
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    for i in range(n_bins):
+        mask = interior & (psi_norm >= edges[i]) & (psi_norm < edges[i+1])
+        bin_idx[mask] = i
+
+    return bin_idx

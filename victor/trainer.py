@@ -404,7 +404,8 @@ def make_train_step(
     lerp_idx_hi     : Optional[jnp.ndarray] = None,   # (N_RADIAL,) int32
     lerp_frac       : Optional[jnp.ndarray] = None,   # (N_RADIAL,) float32
     boundary_colloc : Optional[jnp.ndarray] = None,   # (N_COLLOC, 2) float32
-    psi_flat        : Optional[jnp.ndarray] = None,   # (N_GRID²,) normalised flux
+    flux_bin_idx    : Optional[jnp.ndarray] = None,   # (N_GRID²,) precomputed bins
+    theta_flux      : Optional[jnp.ndarray] = None,   # (N_GRID²,) flux-surface angle
 ):
     """
     Factory that returns a jax.jit-compiled training step for VICTOR.
@@ -496,6 +497,7 @@ def make_train_step(
     # retracing when the same step_fn is reused across steps of the same
     # profile.  When switching to a new profile, make_train_step is called
     # again with the new profile's geometry.
+    
     def _loss_one(model_p, lv, g_clean_i, psi_i, rho_eq_i,
                   sigma, rng_i, xi_i,
                   active_mask, rho_flat_pix, theta_flat, rho_radial):
@@ -503,17 +505,17 @@ def make_train_step(
         coeffs  = model.apply(model_p, g_noisy, psi_i, rho_eq_i, xi_i)
         return loss_fn(
             coeffs, g_noisy, w_ops, active_mask,
-            rho_flat_pix, theta_flat, rho_radial,
+            rho_flat_pix,
+            theta_flux if theta_flux is not None else theta_flat,
+            rho_radial,
             weights        = weights,
-            log_vars       = lv,                # None or dict of JAX scalars
+            log_vars       = lv,
             n_harmonics    = n_harmonics,
-            # [v8.2] Pass closed-over lerp/collocation geometry into loss_fn
-            # so the differentiable interpolation and boundary residuals use
-            # the correct per-profile grid.
             lerp_idx_lo    = lerp_idx_lo,
             lerp_idx_hi    = lerp_idx_hi,
             lerp_frac      = lerp_frac,
             boundary_colloc_idx= boundary_colloc,
+            flux_bin_idx       = flux_bin_idx,
         )
 
     # ── batched loss: vmap over B samples ─────────────────────────────

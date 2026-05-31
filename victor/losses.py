@@ -559,53 +559,30 @@ def loss_poloidal_reg(coeffs: jnp.ndarray) -> jnp.ndarray:
     harmonics = coeffs[:, 1:]        # (N_RADIAL, 2H)
     return jnp.mean(harmonics ** 2)
 def loss_flux_surface(
-    eps2d_flat  : jnp.ndarray,   # (N_GRID²,) predicted emissivity
-    psi_flat    : jnp.ndarray,   # (N_GRID²,) normalised flux [-1, 1]
-    rho_flat    : jnp.ndarray,   # (N_GRID²,) rho for interior mask
-    n_bins      : int = 20,      # flux surface bins
+    eps2d_flat   : jnp.ndarray,   # (N_GRID²,) predicted emissivity
+    flux_bin_idx : jnp.ndarray,   # (N_GRID²,) int32 precomputed bin membership
+    n_bins       : int = 32,
 ) -> jnp.ndarray:
     """
-    Flux surface constraint: emissivity should be constant on ψ=const surfaces.
+    Flux surface constraint using precomputed bin membership.
 
-    Penalises variance of emissivity within each flux bin, enforcing the
-    physical expectation that ε is approximately constant on flux surfaces.
-    This constrains the poloidal blind zones using equilibrium geometry.
-
-    Parameters
-    ----------
-    eps2d_flat : (N_GRID²,)  predicted emissivity
-    psi_flat   : (N_GRID²,)  normalised poloidal flux ψ ∈ [-1, 1]
-    rho_flat   : (N_GRID²,)  normalised radius for interior masking
-    n_bins     : int         number of flux surface bins
-
-    Returns
-    -------
-    scalar float32
+    Much faster than computing bin membership every step — bin_idx is
+    precomputed once per profile in geometry.compute_flux_surface_bins()
+    and closed over in make_train_step.
     """
-    # Normalise psi to [0, 1]
-    psi_norm = (psi_flat + 1.0) / 2.0
-
-    # Only enforce inside the LCFS (rho < 1.0)
-    interior = rho_flat < 1.0
-
-    bin_edges = jnp.linspace(0.0, 1.0, n_bins + 1)
-    total     = jnp.zeros(())
-
+    total = jnp.zeros(())
     for i in range(n_bins):
-        lo   = bin_edges[i]
-        hi   = bin_edges[i + 1]
-        mask = interior & (psi_norm >= lo) & (psi_norm < hi)
-        n    = jnp.maximum(mask.sum(), 1.0)
-
-        # Mean emissivity on this flux surface
+        mask     = flux_bin_idx == i
+        n        = jnp.maximum(mask.sum(), 1.0)
         eps_sum  = jnp.where(mask, eps2d_flat, 0.0).sum()
         mean     = eps_sum / n
-
-        # Variance — penalise deviation from flux-surface mean
-        variance = jnp.where(mask, (eps2d_flat - mean) ** 2, 0.0).sum() / n
+        variance = jnp.where(mask, (eps2d_flat - mean)**2, 0.0).sum() / n
         total    = total + variance
-
     return total / n_bins
+
+        
+
+
 
 # =======================================================================
 # 7.  Adaptive weight helpers  (v8.1 — now JAX arrays; v8.2 +2 keys)
@@ -739,7 +716,7 @@ def loss_fn(
     lerp_frac           : Optional[jnp.ndarray]            = None,  # (N_GRID²,)
     # ── v8.2: collocated boundary enforcement ────────────────────────────
     boundary_colloc_idx : Optional[jnp.ndarray]            = None,  # (N_COLLOC,)
-    psi_flat            : Optional[jnp.ndarray] = None,   # (N_GRID²,) normalised flux
+    flux_bin_idx        : Optional[jnp.ndarray] = None,   # (N_GRID²,) precomputed bins
     # ─────────────────────────────────────────────────────────────────────
     weights             : LossWeights                      = DEFAULT_WEIGHTS,
     log_vars            : Optional[Dict[str, jnp.ndarray]] = None,
@@ -829,8 +806,8 @@ def loss_fn(
     l_pol      = loss_poloidal_reg(coeffs)
 
     # Flux surface constraint — enforce ε=const on ψ surfaces
-    if psi_flat is not None:
-        l_flux = loss_flux_surface(eps2d_flat, psi_flat, rho_flat)
+    if flux_bin_idx is not None:
+        l_flux = loss_flux_surface(eps2d_flat, flux_bin_idx)
     else:
         l_flux = jnp.zeros(())
 
