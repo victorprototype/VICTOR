@@ -238,17 +238,16 @@ def build_eps2d(
         nn_idx     = jnp.argmin(diffs, axis=1)                    # (N²,)
         coeffs_pix = coeffs[nn_idx]                               # (N², NC)
 
-    # ── Evaluate ε(ρ, θ) = a0 + Σ_n [an·cos(nθ) + bn·sin(nθ)] ─────────
+    # ── Evaluate ε(ρ, θ) = a0 + Σ_n [an·cos(nθ)] ────────────────────
     # Start with the isotropic (a0) component
     eps = coeffs_pix[:, 0]                                        # (N²,)
 
-    # Accumulate angular harmonics  (corresponds to L_f §3.1)
+    # Accumulate angular harmonics — cosine only (up-down symmetric)
+    # sin terms forced to zero in model.py; all profiles have perfect
+    # up-down symmetry (asymmetry = 0.0 across all profiles).
     for h in range(1, n_harmonics + 1):
         a_col = 2 * h - 1
-        b_col = 2 * h
-        eps   = (eps
-                 + coeffs_pix[:, a_col] * jnp.cos(h * theta_flat)
-                 + coeffs_pix[:, b_col] * jnp.sin(h * theta_flat))
+        eps   = eps + coeffs_pix[:, a_col] * jnp.cos(h * theta_flat)
 
     # Zero pixels outside the model's radial domain
     eps = jnp.where(rho_flat <= cfg.RHO_MAX, eps, 0.0)

@@ -642,10 +642,18 @@ class FourierDeepONetV8(nn.Module):
         z_head = nn.relu(z_head)
         coeffs = nn.Dense(NC)(z_head)                                    # (L, NC)
 
-        # ── softplus on a0 only; small init on harmonics ──────────────────
+        # ── softplus on a0; cosine-only harmonics (sin=0, up-down symmetric) ──
         a0        = nn.softplus(coeffs[:, :1])                           # (L, 1)
-        harmonics = coeffs[:, 1:] * 0.1                                  # (L, NC-1)
-        return jnp.concatenate([a0, harmonics], axis=-1)                 # (L, NC)
+        # Only cosine terms are active — sin terms forced to zero since all
+        # profiles are perfectly up-down symmetric (asymmetry = 0.0).
+        n_harmonics = (NC - 1) // 2                                      # = N_HARMONICS
+        cos_terms = coeffs[:, 1:1+n_harmonics] * 0.1                    # (L, H) cos only
+        sin_terms = jnp.zeros((coeffs.shape[0], n_harmonics))           # (L, H) forced zero
+        # Interleave cos and sin: [a0, a1, b1=0, a2, b2=0, ...]
+        harmonics = jnp.zeros((coeffs.shape[0], NC - 1))
+        harmonics = harmonics.at[:, 0::2].set(cos_terms)                # even = cos
+        harmonics = harmonics.at[:, 1::2].set(sin_terms)               # odd = sin=0
+        return jnp.concatenate([a0, harmonics], axis=-1)                # (L, NC)
 
 
 # ═══════════════════════════════════════════════════════════════════════
