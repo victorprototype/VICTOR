@@ -571,9 +571,11 @@ def plot_profile_panel(
 
     # ── [1,2] Radial coefficient profiles ────────────────────────────
     ax12 = fig.add_subplot(gs[1, 2], facecolor=_AX_BG)
-    coef_colors = ['#3fb950', '#f78166', '#58a6ff', '#e3b341', '#bc8cff']
+    coef_colors = ['#3fb950', '#f78166', '#58a6ff', '#e3b341', '#bc8cff',
+               '#ff7b72', '#79c0ff', '#ffa657', '#d2a8ff', '#56d364',
+               '#f0883e', '#338ef7', '#db61a2']
     nc = coeffs.shape[1]
-    labels = ['a0', 'a1', 'b1', 'a2', 'b2'][:nc]
+    labels = ['a0'] + [f'{"ab"[i%2]}{i//2+1}' for i in range(nc - 1)]
     for ch in range(nc):
         ax12.plot(rho_radial, coeffs[:, ch],
                   color=coef_colors[ch % len(coef_colors)],
