@@ -291,6 +291,7 @@ class LossWeights(NamedTuple):
     w_pol             : float = 0.001
     w_boundary_colloc : float = 0.1    # was 2.0 — was exploding to 109
     w_mono            : float = 0.01   # was 0.1 — trivially zero, reduce
+    w_flux            : float = 0.1    # flux surface constraint — new
 
 # Singleton default weights
 DEFAULT_WEIGHTS = LossWeights()
@@ -557,7 +558,54 @@ def loss_poloidal_reg(coeffs: jnp.ndarray) -> jnp.ndarray:
     """
     harmonics = coeffs[:, 1:]        # (N_RADIAL, 2H)
     return jnp.mean(harmonics ** 2)
+def loss_flux_surface(
+    eps2d_flat  : jnp.ndarray,   # (N_GRID²,) predicted emissivity
+    psi_flat    : jnp.ndarray,   # (N_GRID²,) normalised flux [-1, 1]
+    rho_flat    : jnp.ndarray,   # (N_GRID²,) rho for interior mask
+    n_bins      : int = 20,      # flux surface bins
+) -> jnp.ndarray:
+    """
+    Flux surface constraint: emissivity should be constant on ψ=const surfaces.
 
+    Penalises variance of emissivity within each flux bin, enforcing the
+    physical expectation that ε is approximately constant on flux surfaces.
+    This constrains the poloidal blind zones using equilibrium geometry.
+
+    Parameters
+    ----------
+    eps2d_flat : (N_GRID²,)  predicted emissivity
+    psi_flat   : (N_GRID²,)  normalised poloidal flux ψ ∈ [-1, 1]
+    rho_flat   : (N_GRID²,)  normalised radius for interior masking
+    n_bins     : int         number of flux surface bins
+
+    Returns
+    -------
+    scalar float32
+    """
+    # Normalise psi to [0, 1]
+    psi_norm = (psi_flat + 1.0) / 2.0
+
+    # Only enforce inside the LCFS (rho < 1.0)
+    interior = rho_flat < 1.0
+
+    bin_edges = jnp.linspace(0.0, 1.0, n_bins + 1)
+    total     = jnp.zeros(())
+
+    for i in range(n_bins):
+        lo   = bin_edges[i]
+        hi   = bin_edges[i + 1]
+        mask = interior & (psi_norm >= lo) & (psi_norm < hi)
+        n    = jnp.maximum(mask.sum(), 1.0)
+
+        # Mean emissivity on this flux surface
+        eps_sum  = jnp.where(mask, eps2d_flat, 0.0).sum()
+        mean     = eps_sum / n
+
+        # Variance — penalise deviation from flux-surface mean
+        variance = jnp.where(mask, (eps2d_flat - mean) ** 2, 0.0).sum() / n
+        total    = total + variance
+
+    return total / n_bins
 
 # =======================================================================
 # 7.  Adaptive weight helpers  (v8.1 — now JAX arrays; v8.2 +2 keys)
@@ -644,6 +692,7 @@ def _adaptive_combine(
         "pde"             : weights.w_pde,
         "mono"            : weights.w_mono,
         "pol"             : weights.w_pol,
+        "flux"            : weights.w_flux,    # new
     }
     total = jnp.zeros(())
     w_eff = {}
@@ -690,6 +739,7 @@ def loss_fn(
     lerp_frac           : Optional[jnp.ndarray]            = None,  # (N_GRID²,)
     # ── v8.2: collocated boundary enforcement ────────────────────────────
     boundary_colloc_idx : Optional[jnp.ndarray]            = None,  # (N_COLLOC,)
+    psi_flat            : Optional[jnp.ndarray] = None,   # (N_GRID²,) normalised flux
     # ─────────────────────────────────────────────────────────────────────
     weights             : LossWeights                      = DEFAULT_WEIGHTS,
     log_vars            : Optional[Dict[str, jnp.ndarray]] = None,
@@ -778,6 +828,13 @@ def loss_fn(
 
     l_pol      = loss_poloidal_reg(coeffs)
 
+    # Flux surface constraint — enforce ε=const on ψ surfaces
+    if psi_flat is not None:
+        l_flux = loss_flux_surface(eps2d_flat, psi_flat, rho_flat)
+    else:
+        l_flux = jnp.zeros(())
+
+
     components = {
         "proj"            : l_proj,
         "boundary"        : l_boundary,
@@ -787,6 +844,7 @@ def loss_fn(
         "pde"             : l_pde,
         "mono"            : l_mono,              # v8.2 new
         "pol"             : l_pol,
+        "flux"            : l_flux,            # new
     }
 
     loss_dict = dict(components)
@@ -803,6 +861,7 @@ def loss_fn(
           + weights.w_pde             * l_pde
           + weights.w_mono            * l_mono               # v8.2 new
           + weights.w_pol             * l_pol
+          + weights.w_flux            * l_flux               # new
         )
     else:
         # Dynamic lbPINN mode — log_vars must be JAX arrays in grad tree

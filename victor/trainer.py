@@ -404,6 +404,7 @@ def make_train_step(
     lerp_idx_hi     : Optional[jnp.ndarray] = None,   # (N_RADIAL,) int32
     lerp_frac       : Optional[jnp.ndarray] = None,   # (N_RADIAL,) float32
     boundary_colloc : Optional[jnp.ndarray] = None,   # (N_COLLOC, 2) float32
+    psi_flat        : Optional[jnp.ndarray] = None,   # (N_GRID²,) normalised flux
 ):
     """
     Factory that returns a jax.jit-compiled training step for VICTOR.
