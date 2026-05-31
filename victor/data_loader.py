@@ -526,6 +526,8 @@ def load_profiles(
             R_flat  = R_pix_np.astype(np.float64),
             Z_flat  = Z_pix_np.astype(np.float64),
         )
+        theta_flux_np = ((theta_flux_np + np.pi) % (2 * np.pi)) - np.pi
+
         flux_bin_idx_np = geometry.compute_flux_surface_bins(
             psi_flat = np.array(_safe_norm_11(psi_grid).flatten()),
             rho_flat = np.array(grids.RHO_FLAT),
