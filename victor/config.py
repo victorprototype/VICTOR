@@ -45,7 +45,7 @@ N_RADIAL = 128      # radial output points of FourierDeepONet
 RHO_MAX  = 1.2      # upper bound of radial axis (beyond LCFS at ρ=1)
 
 # ── Poloidal harmonics (v8) ───────────────────────────────────
-N_HARMONICS   = 2   # number of Fourier harmonics H retained in the poloidal
+N_HARMONICS   = 6   # number of Fourier harmonics H retained in the poloidal
                     # expansion.  Assumes up-down symmetry (sin terms are zero
                     # for purely symmetric equilibria), so only cosine pairs are
                     # physically active by default.
